@@ -8,6 +8,7 @@ license = {text = "CC-BY-NC-4.0"}
 authors = [{name = "Xuning Yang"}]
 dependencies = [
     # Core
+    "isaacsim[all,extscache]==5.0.0",
     "isaaclab==2.2.0",
     "torch",
     "numpy",
@@ -49,7 +50,9 @@ include = ["robolab", "robolab.*"]
 [tool.uv]
 prerelease = "allow"
 index-strategy = "unsafe-best-match"
-no-build-isolation-package = ["flatdict"]
+
+[tool.uv.extra-build-dependencies]
+flatdict = ["setuptools<81"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

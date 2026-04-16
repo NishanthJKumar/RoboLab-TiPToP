@@ -20,7 +20,11 @@
 
 ## Getting Started
 
-Requires [Isaac Lab](https://github.com/isaac-sim/IsaacLab) and [uv](https://docs.astral.sh/uv/getting-started/installation/). See [Requirements](#requirements) for versions and hardware.
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/), an NVIDIA driver supporting CUDA 12.8, and the system packages `cmake` and `build-essential`. See [Requirements](#requirements) for versions and hardware.
+
+```bash
+sudo apt install cmake build-essential
+```
 
 ### Installation
 
@@ -29,9 +33,10 @@ git clone https://github.com/NVlabs/RoboLab.git
 cd robolab
 uv venv --python 3.11
 source .venv/bin/activate
-uv pip install "setuptools<81"
 uv sync
 ```
+
+`uv sync` pulls in Isaac Sim 5.0 and Isaac Lab 2.2.0 automatically. The first time you launch an Isaac Sim script, you'll be prompted to accept NVIDIA's EULA and extensions will download (~10 min).
 
 Verify installation:
 ```bash
