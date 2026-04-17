@@ -24,7 +24,7 @@ The columns are:
 - Tags: Tag names this environment belongs to
 
 """
-def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensity=None, task=None):
+def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensity=None, task=None, enable_camera_params=False):
     """Automatically discover and register tasks.
 
     Args:
@@ -33,6 +33,10 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         task: If provided, only register the specified task(s) instead of discovering
               all tasks. Accepts a single task name/filename/path (str) or a list of them.
               Significantly faster when running a subset of tasks.
+        enable_camera_params: If True, enable wrist-camera depth + intrinsics + extrinsics
+              observations (required by TipTop). Off by default because adding
+              ``distance_to_image_plane`` to the tiled wrist camera roughly doubles its
+              render-buffer VRAM cost, which pushes high ``num_envs`` runs out of memory.
     """
     from robolab.core.environments.factory import auto_discover_and_create_cfgs, create_env_cfg
     from robolab.core.observations.observation_utils import generate_image_obs_from_cameras, generate_obs_cfg
@@ -49,10 +53,20 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
 
     ViewportCameraCfg = generate_image_obs_from_cameras([EgocentricMirroredCameraCfg])
 
-    ObservationCfg = generate_obs_cfg({
+    obs_groups = {
         "image_obs": ImageObsCfg(),
         "proprio_obs": ProprioceptionObservationCfg(),
-        "viewport_cam": ViewportCameraCfg()})
+        "viewport_cam": ViewportCameraCfg(),
+    }
+
+    if enable_camera_params:
+        from robolab.robots.droid_camera_params import CameraParamsObservationCfg
+        # Enable depth on the wrist camera — cost: ~2x wrist render-buffer VRAM per env.
+        if "distance_to_image_plane" not in DroidCfg.wrist_cam.data_types:
+            DroidCfg.wrist_cam.data_types = list(DroidCfg.wrist_cam.data_types) + ["distance_to_image_plane"]
+        obs_groups["camera_params_obs"] = CameraParamsObservationCfg()
+
+    ObservationCfg = generate_obs_cfg(obs_groups)
 
     shared_kwargs = dict(
         observations_cfg=ObservationCfg(),

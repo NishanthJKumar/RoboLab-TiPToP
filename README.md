@@ -55,7 +55,7 @@ python examples/demo/run_recorded.py --headless
 
 ### Run with a policy
 
-RoboLab uses a **server-client architecture**: your model runs as a standalone server, and RoboLab connects to it via a lightweight inference client. To quickly test RoboLab, try [Pi0-5 via OpenPI](docs/inference.md#openpi-pi0--pi0-fast--pi05).
+RoboLab uses a **server-client architecture**: your model runs as a standalone server, and RoboLab connects to it via a lightweight inference client. To quickly test RoboLab, try [Pi0-5 via OpenPI](docs/inference.md#openpi-pi0--pi0-fast--pi05). For planner-based evaluation, see the [TipTop planner](docs/inference.md#tiptop-planner) section.
 
 1. Start your policy server in a separate terminal.
 2. Run evaluation:
