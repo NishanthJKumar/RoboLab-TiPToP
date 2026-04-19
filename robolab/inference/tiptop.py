@@ -15,13 +15,11 @@ state is added.
 import json
 import logging
 import time
-from io import BytesIO
 from typing import Optional
 
 import msgpack_numpy
 import numpy as np
 import websockets.sync.client
-from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from .base_client import InferenceClient
@@ -137,17 +135,6 @@ class TiptopWebsocketClient(InferenceClient):
 
         return self._step_plan(curr_obs)
 
-    def _encode_png(self, image: np.ndarray) -> bytes:
-        if image.dtype != np.uint8:
-            img = image
-            if np.issubdtype(img.dtype, np.floating) and img.max() <= 1.0:
-                img = img * 255.0
-            image = np.clip(img, 0, 255).astype(np.uint8)
-        pil_img = Image.fromarray(image)
-        buf = BytesIO()
-        pil_img.save(buf, format="PNG")
-        return buf.getvalue()
-
     def _query_server(self, raw_obs: dict, curr_obs: dict, instruction: str, *, env_id: int) -> None:
         if self._ws is None:
             self._connect()
@@ -172,12 +159,22 @@ class TiptopWebsocketClient(InferenceClient):
 
         if response["success"]:
             steps = response["plan"]["steps"]
+            executable_types = {"trajectory", "gripper"}
+            self._plan = []
             for step in steps:
-                if step["type"] == "trajectory":
+                step_type = step["type"]
+                if step_type == "metadata":
+                    continue
+                if step_type not in executable_types:
+                    raise PlanningError(
+                        f"TipTop server returned unsupported step type '{step_type}'. "
+                        f"Expected one of {sorted(executable_types)}."
+                    )
+                if step_type == "trajectory":
                     step["positions"] = np.array(step["positions"], dtype=np.float32)
                     if "velocities" in step:
                         step["velocities"] = np.array(step["velocities"], dtype=np.float32)
-            self._plan = [s for s in steps if s["type"] != "metadata"]
+                self._plan.append(step)
             _log.info(f"Received plan with {len(self._plan)} steps in {elapsed:.1f}s")
             for i, step in enumerate(self._plan):
                 if step["type"] == "trajectory":
@@ -186,10 +183,8 @@ class TiptopWebsocketClient(InferenceClient):
                     _log.info(
                         f"  Step {i}: trajectory ({orig_len} -> {subsampled_len} waypoints after subsampling)"
                     )
-                elif step["type"] == "gripper":
-                    _log.info(f"  Step {i}: gripper {step['action']}")
                 else:
-                    _log.info(f"  Step {i}: unknown step type '{step['type']}'")
+                    _log.info(f"  Step {i}: gripper {step['action']}")
         else:
             error_msg = response.get("error", "unknown")
             _log.error(f"TipTop server returned error: {error_msg}")

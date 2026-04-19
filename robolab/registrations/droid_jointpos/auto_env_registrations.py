@@ -54,8 +54,10 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
     ViewportCameraCfg = generate_image_obs_from_cameras([EgocentricMirroredCameraCfg])
 
     if enable_camera_params:
-        # TipTop path: it only consumes the wrist camera (RGB + depth + intrinsics/extrinsics)
-        # at plan time. Drop external_cam and viewport cam to save render cost every step.
+        # TipTop path: the planner only consumes the wrist camera (RGB + depth +
+        # intrinsics/extrinsics) at plan time, so we drop the per-step external_cam from
+        # image_obs. viewport_cam is kept because it drives the video-recording pipeline,
+        # not the agent's per-step observation cost.
         from isaaclab.managers import ObservationGroupCfg as ObsGroup
         from isaaclab.managers import ObservationTermCfg as ObsTerm
         from isaaclab.managers import SceneEntityCfg
@@ -84,17 +86,22 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         }
 
         from robolab.robots.droid_camera_params import CameraParamsObservationCfg
-        # Enable depth on the wrist camera — cost: ~2x wrist render-buffer VRAM per env.
-        # @configclass turns wrist_cam into a dataclass field with a default_factory,
-        # so we patch the factory rather than the (absent) class attribute.
-        _wrist_field = DroidCfg.__dataclass_fields__["wrist_cam"]
-        _orig_factory = _wrist_field.default_factory
-        def _wrist_factory_with_depth(_orig=_orig_factory):
-            cam = _orig()
-            if "distance_to_image_plane" not in cam.data_types:
-                cam.data_types = list(cam.data_types) + ["distance_to_image_plane"]
-            return cam
-        _wrist_field.default_factory = _wrist_factory_with_depth
+
+        # Enable depth on the wrist camera on a dedicated subclass so the base DroidCfg
+        # stays untouched — otherwise every future DroidCfg() in the process would pay
+        # the ~2x wrist render-buffer VRAM cost, even for non-TipTop runs.
+        @configclass
+        class DroidCfgWithWristDepth(DroidCfg):
+            def __post_init__(self) -> None:
+                parent_post = getattr(super(), "__post_init__", None)
+                if callable(parent_post):
+                    parent_post()
+                if "distance_to_image_plane" not in self.wrist_cam.data_types:
+                    self.wrist_cam.data_types = list(self.wrist_cam.data_types) + [
+                        "distance_to_image_plane"
+                    ]
+
+        robot_cfg_cls = DroidCfgWithWristDepth
         obs_groups["camera_params_obs"] = CameraParamsObservationCfg()
 
         camera_cfg = [EgocentricMirroredCameraCfg]
@@ -105,13 +112,14 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
             "viewport_cam": ViewportCameraCfg(),
         }
         camera_cfg = [OverShoulderLeftCameraCfg, EgocentricMirroredCameraCfg]
+        robot_cfg_cls = DroidCfg
 
     ObservationCfg = generate_obs_cfg(obs_groups)
 
     shared_kwargs = dict(
         observations_cfg=ObservationCfg(),
         actions_cfg=DroidJointPositionActionCfg(),
-        robot_cfg=DroidCfg,
+        robot_cfg=robot_cfg_cls,
         camera_cfg=camera_cfg,
         lighting_cfg=SphereLightCfg,
         background_cfg=HomeOfficeBackgroundCfg,
