@@ -343,9 +343,15 @@ class TiptopWebsocketClient(InferenceClient):
     def _extract_observation(self, obs_dict: dict, *, env_id: int = 0) -> dict:
         image_obs = obs_dict["image_obs"]
         proprio_obs = obs_dict["proprio_obs"]
+        wrist_image = image_obs["wrist_cam"][env_id].clone().detach().cpu().numpy()
+        # external_cam is only used for the debug viz concat; fall back to wrist if absent.
+        if "external_cam" in image_obs:
+            right_image = image_obs["external_cam"][env_id].clone().detach().cpu().numpy()
+        else:
+            right_image = wrist_image
         return {
-            "right_image": image_obs["external_cam"][env_id].clone().detach().cpu().numpy(),
-            "wrist_image": image_obs["wrist_cam"][env_id].clone().detach().cpu().numpy(),
+            "right_image": right_image,
+            "wrist_image": wrist_image,
             "joint_position": proprio_obs["arm_joint_pos"][env_id].clone().detach().cpu().numpy(),
             "gripper_position": proprio_obs["gripper_pos"][env_id].clone().detach().cpu().numpy(),
         }

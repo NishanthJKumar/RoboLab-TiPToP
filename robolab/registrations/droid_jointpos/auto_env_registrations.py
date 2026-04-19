@@ -53,18 +53,57 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
 
     ViewportCameraCfg = generate_image_obs_from_cameras([EgocentricMirroredCameraCfg])
 
-    obs_groups = {
-        "image_obs": ImageObsCfg(),
-        "proprio_obs": ProprioceptionObservationCfg(),
-        "viewport_cam": ViewportCameraCfg(),
-    }
-
     if enable_camera_params:
+        # TipTop path: it only consumes the wrist camera (RGB + depth + intrinsics/extrinsics)
+        # at plan time. Drop external_cam and viewport cam to save render cost every step.
+        from isaaclab.managers import ObservationGroupCfg as ObsGroup
+        from isaaclab.managers import ObservationTermCfg as ObsTerm
+        from isaaclab.managers import SceneEntityCfg
+        from isaaclab.utils import configclass
+        import isaaclab.envs.mdp as mdp
+
+        @configclass
+        class WristOnlyImageObsCfg(ObsGroup):
+            wrist_cam = ObsTerm(
+                func=mdp.observations.image,
+                params={
+                    "sensor_cfg": SceneEntityCfg("wrist_cam"),
+                    "data_type": "rgb",
+                    "normalize": False,
+                },
+            )
+
+            def __post_init__(self) -> None:
+                self.enable_corruption = False
+                self.concatenate_terms = False
+
+        obs_groups = {
+            "image_obs": WristOnlyImageObsCfg(),
+            "proprio_obs": ProprioceptionObservationCfg(),
+        }
+
         from robolab.robots.droid_camera_params import CameraParamsObservationCfg
         # Enable depth on the wrist camera — cost: ~2x wrist render-buffer VRAM per env.
-        if "distance_to_image_plane" not in DroidCfg.wrist_cam.data_types:
-            DroidCfg.wrist_cam.data_types = list(DroidCfg.wrist_cam.data_types) + ["distance_to_image_plane"]
+        # @configclass turns wrist_cam into a dataclass field with a default_factory,
+        # so we patch the factory rather than the (absent) class attribute.
+        _wrist_field = DroidCfg.__dataclass_fields__["wrist_cam"]
+        _orig_factory = _wrist_field.default_factory
+        def _wrist_factory_with_depth(_orig=_orig_factory):
+            cam = _orig()
+            if "distance_to_image_plane" not in cam.data_types:
+                cam.data_types = list(cam.data_types) + ["distance_to_image_plane"]
+            return cam
+        _wrist_field.default_factory = _wrist_factory_with_depth
         obs_groups["camera_params_obs"] = CameraParamsObservationCfg()
+
+        camera_cfg = []
+    else:
+        obs_groups = {
+            "image_obs": ImageObsCfg(),
+            "proprio_obs": ProprioceptionObservationCfg(),
+            "viewport_cam": ViewportCameraCfg(),
+        }
+        camera_cfg = [OverShoulderLeftCameraCfg, EgocentricMirroredCameraCfg]
 
     ObservationCfg = generate_obs_cfg(obs_groups)
 
@@ -72,7 +111,7 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         observations_cfg=ObservationCfg(),
         actions_cfg=DroidJointPositionActionCfg(),
         robot_cfg=DroidCfg,
-        camera_cfg=[OverShoulderLeftCameraCfg, EgocentricMirroredCameraCfg],
+        camera_cfg=camera_cfg,
         lighting_cfg=SphereLightCfg,
         background_cfg=HomeOfficeBackgroundCfg,
         contact_gripper=contact_gripper,
