@@ -80,6 +80,7 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         obs_groups = {
             "image_obs": WristOnlyImageObsCfg(),
             "proprio_obs": ProprioceptionObservationCfg(),
+            "viewport_cam": ViewportCameraCfg(),
         }
 
         from robolab.robots.droid_camera_params import CameraParamsObservationCfg
@@ -96,7 +97,7 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         _wrist_field.default_factory = _wrist_factory_with_depth
         obs_groups["camera_params_obs"] = CameraParamsObservationCfg()
 
-        camera_cfg = []
+        camera_cfg = [EgocentricMirroredCameraCfg]
     else:
         obs_groups = {
             "image_obs": ImageObsCfg(),
