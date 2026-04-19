@@ -8,6 +8,7 @@ RoboLab uses a **server-client architecture**: your model runs as a standalone s
 |--------|-------------|----------|-------------|--------------|
 | Pi0 / Pi0-fast / Pi05 | `Pi0DroidJointposClient` | WebSocket (OpenPI) | 8000 | `openpi-client` |
 | GR00T | `GR00TDroidJointposClient` | ZMQ | 5555 | `zmq`, `msgpack` |
+| TipTop | `TiptopWebsocketClient` | WebSocket (msgpack) | 8765 | `websockets`, `msgpack-numpy` |
 
 All clients live in `robolab/inference/` and implement the `InferenceClient` base class:
 
@@ -123,6 +124,40 @@ uv run python gr00t/eval/run_gr00t_server.py \
 cd robolab
 uv run python examples/policy/run_eval.py --policy gr00t --remote-host 0.0.0.0 --remote-port 5555 --headless
 ```
+
+---
+
+## TipTop Planner
+
+TipTop is a task-and-motion planner that returns a full trajectory plan for a task rather than per-step actions. Unlike learned policies, it consumes wrist-camera depth + intrinsics + extrinsics (in addition to RGB) and is queried once per episode; RoboLab then steps through the returned waypoints and gripper actions.
+
+When the plan finishes executing, the env is frozen and its recording is exported. This is *not* a sim termination — RoboLab's success predicates run independently.
+
+### Install the server
+
+Clone and follow install instructions in the [`tiptop-robot`](https://github.com/tiptop-robot/tiptop-robot) repo. **Do not** install TipTop in the RoboLab venv — it runs as a separate process.
+
+### Start the policy server
+
+```bash
+pixi run python -m tiptop.websocket_server --port 8765
+```
+
+### Run evaluation
+
+```bash
+cd robolab
+uv run python examples/policy/run_eval.py \
+    --policy tiptop \
+    --task BananaInBowlTask \
+    --num-envs 1 \
+    --remote-port 8765 \
+    --headless
+```
+
+**Limitations (v1)**:
+- Single-env only. Launch with `--num-envs 1`; multi-env will raise an error.
+- The client reconnects to the server at the start of every episode (via `client.reset()`) to clear stale server-side planner state.
 
 ---
 

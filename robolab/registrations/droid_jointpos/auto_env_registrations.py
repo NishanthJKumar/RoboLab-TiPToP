@@ -24,7 +24,7 @@ The columns are:
 - Tags: Tag names this environment belongs to
 
 """
-def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensity=None, task=None):
+def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensity=None, task=None, enable_camera_params=False):
     """Automatically discover and register tasks.
 
     Args:
@@ -33,6 +33,10 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         task: If provided, only register the specified task(s) instead of discovering
               all tasks. Accepts a single task name/filename/path (str) or a list of them.
               Significantly faster when running a subset of tasks.
+        enable_camera_params: If True, enable wrist-camera depth + intrinsics + extrinsics
+              observations (required by TipTop). Off by default because adding
+              ``distance_to_image_plane`` to the tiled wrist camera roughly doubles its
+              render-buffer VRAM cost, which pushes high ``num_envs`` runs out of memory.
     """
     from robolab.core.environments.factory import auto_discover_and_create_cfgs, create_env_cfg
     from robolab.core.observations.observation_utils import generate_image_obs_from_cameras, generate_obs_cfg
@@ -49,16 +53,74 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
 
     ViewportCameraCfg = generate_image_obs_from_cameras([EgocentricMirroredCameraCfg])
 
-    ObservationCfg = generate_obs_cfg({
-        "image_obs": ImageObsCfg(),
-        "proprio_obs": ProprioceptionObservationCfg(),
-        "viewport_cam": ViewportCameraCfg()})
+    if enable_camera_params:
+        # TipTop path: the planner only consumes the wrist camera (RGB + depth +
+        # intrinsics/extrinsics) at plan time, so we drop the per-step external_cam from
+        # image_obs. viewport_cam is kept because it drives the video-recording pipeline,
+        # not the agent's per-step observation cost.
+        from isaaclab.managers import ObservationGroupCfg as ObsGroup
+        from isaaclab.managers import ObservationTermCfg as ObsTerm
+        from isaaclab.managers import SceneEntityCfg
+        from isaaclab.utils import configclass
+        import isaaclab.envs.mdp as mdp
+
+        @configclass
+        class WristOnlyImageObsCfg(ObsGroup):
+            wrist_cam = ObsTerm(
+                func=mdp.observations.image,
+                params={
+                    "sensor_cfg": SceneEntityCfg("wrist_cam"),
+                    "data_type": "rgb",
+                    "normalize": False,
+                },
+            )
+
+            def __post_init__(self) -> None:
+                self.enable_corruption = False
+                self.concatenate_terms = False
+
+        obs_groups = {
+            "image_obs": WristOnlyImageObsCfg(),
+            "proprio_obs": ProprioceptionObservationCfg(),
+            "viewport_cam": ViewportCameraCfg(),
+        }
+
+        from robolab.robots.droid_camera_params import CameraParamsObservationCfg
+
+        # Enable depth on the wrist camera on a dedicated subclass so the base DroidCfg
+        # stays untouched — otherwise every future DroidCfg() in the process would pay
+        # the ~2x wrist render-buffer VRAM cost, even for non-TipTop runs.
+        @configclass
+        class DroidCfgWithWristDepth(DroidCfg):
+            def __post_init__(self) -> None:
+                parent_post = getattr(super(), "__post_init__", None)
+                if callable(parent_post):
+                    parent_post()
+                if "distance_to_image_plane" not in self.wrist_cam.data_types:
+                    self.wrist_cam.data_types = list(self.wrist_cam.data_types) + [
+                        "distance_to_image_plane"
+                    ]
+
+        robot_cfg_cls = DroidCfgWithWristDepth
+        obs_groups["camera_params_obs"] = CameraParamsObservationCfg()
+
+        camera_cfg = [EgocentricMirroredCameraCfg]
+    else:
+        obs_groups = {
+            "image_obs": ImageObsCfg(),
+            "proprio_obs": ProprioceptionObservationCfg(),
+            "viewport_cam": ViewportCameraCfg(),
+        }
+        camera_cfg = [OverShoulderLeftCameraCfg, EgocentricMirroredCameraCfg]
+        robot_cfg_cls = DroidCfg
+
+    ObservationCfg = generate_obs_cfg(obs_groups)
 
     shared_kwargs = dict(
         observations_cfg=ObservationCfg(),
         actions_cfg=DroidJointPositionActionCfg(),
-        robot_cfg=DroidCfg,
-        camera_cfg=[OverShoulderLeftCameraCfg, EgocentricMirroredCameraCfg],
+        robot_cfg=robot_cfg_cls,
+        camera_cfg=camera_cfg,
         lighting_cfg=SphereLightCfg,
         background_cfg=HomeOfficeBackgroundCfg,
         contact_gripper=contact_gripper,

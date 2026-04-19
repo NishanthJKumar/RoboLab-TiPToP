@@ -18,6 +18,8 @@ dependencies = [
     "json_numpy",
     "pyzmq",
     "msgpack",
+    "msgpack-numpy",
+    "websockets",
     # Computer vision and image processing
     "opencv-python",
     "Pillow",

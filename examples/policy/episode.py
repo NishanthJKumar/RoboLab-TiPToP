@@ -87,9 +87,16 @@ def run_episode(env, env_cfg, episode, headless=False, save_videos=True, video_m
         from robolab.inference.openvla import OpenVLAClient as PolicyClient
     elif backend == "openvla_oft":
         from robolab.inference.openvla_oft import OpenVLAOFTClient as PolicyClient
+    elif backend == "tiptop":
+        from robolab.inference.tiptop import TiptopWebsocketClient as PolicyClient
+        if env.num_envs != 1:
+            raise ValueError(
+                f"TipTop backend requires --num-envs 1 (got {env.num_envs}). "
+                "Multi-env TipTop is not yet supported."
+            )
     else:
         raise ValueError(
-            f"Unsupported policy '{backend}'. Choose 'pi0', 'pi0_fast', 'pi05', 'paligemma', 'paligemma_fast', 'gr00t', 'dreamzero', 'molmo', 'openvla', 'openvla_oft'"
+            f"Unsupported policy '{backend}'. Choose 'pi0', 'pi0_fast', 'pi05', 'paligemma', 'paligemma_fast', 'gr00t', 'dreamzero', 'molmo', 'openvla', 'openvla_oft', 'tiptop'"
         )
 
     obs, _ = env.reset()
@@ -179,6 +186,20 @@ def run_episode(env, env_cfg, episode, headless=False, save_videos=True, video_m
             timer.stop("video_write")
 
         actual_steps += 1
+
+        # Planner-based backends (TipTop) signal episode completion via plan_done
+        # rather than a sim termination. Freeze the env so it stops stepping and
+        # its recording gets exported, mirroring RobolabEnv._reset_idx.
+        for env_id in env.active_env_ids:
+            if getattr(clients[env_id], "plan_done", False):
+                env._frozen_envs[env_id] = True
+                env._env_results[env_id] = bool(env.termination_manager.terminated[env_id])
+                env._env_term_step[env_id] = int(env.episode_length_buf[env_id].item())
+                if env.recorder_manager is not None:
+                    try:
+                        env.recorder_manager.export_episodes(env_ids=[env_id])
+                    except Exception:
+                        pass
 
         # RobolabEnv freezes terminated envs and exports recordings automatically
         if env.all_terminated:

@@ -53,8 +53,8 @@ parser.add_argument("--tag", nargs='+', default=None,
 parser.add_argument("--task-dirs", nargs='+', default=DEFAULT_TASK_SUBFOLDERS,
                        help="List of task directories to evaluate on")
 parser.add_argument("--policy",
-                    choices=["pi0", "pi0_fast", "paligemma", "paligemma_fast", "pi05", "gr00t", "dreamzero", "molmo", "openvla", "openvla_oft"], default="pi05",
-                       help="Action-prediction backend to use (default: pi05)")
+                    choices=["pi0", "pi0_fast", "paligemma", "paligemma_fast", "pi05", "gr00t", "dreamzero", "molmo", "openvla", "openvla_oft", "tiptop"], default="pi05",
+                       help="Action-prediction backend to use (default: pi05). For 'tiptop' pass --remote-port 8765 and --num-envs 1.")
 parser.add_argument("--num-runs", "--num_runs", type=int, default=1,
                        help="Number of sequential runs per task (default: 1). Total episodes = num_runs * num_envs. Prefer increasing --num_envs for more episodes. Only increase --num-runs if you run out of GPU memory with the desired num_envs.")
 parser.add_argument("--enable-subtask", "--enable_subtask", action="store_true",
@@ -108,7 +108,14 @@ patch_recorder_manager()
 
 # Run automatic factory generation before main
 from robolab.registrations.droid_jointpos.auto_env_registrations import auto_register_droid_envs # noqa
-auto_register_droid_envs(task_dirs=args_cli.task_dirs, task=args_cli.task)
+# TipTop needs wrist-camera depth + intrinsics + extrinsics. Enabling this for
+# other policies roughly doubles wrist-camera VRAM (it adds distance_to_image_plane
+# to the TiledCamera), which OOMs at high --num-envs. Keep it gated.
+auto_register_droid_envs(
+    task_dirs=args_cli.task_dirs,
+    task=args_cli.task,
+    enable_camera_params=(args_cli.policy == "tiptop"),
+)
 
 EVENT_STATUS_CODES = {
     StatusCode.WRONG_OBJECT_GRABBED_FAILURE,
