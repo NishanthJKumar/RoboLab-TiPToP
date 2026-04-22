@@ -94,7 +94,7 @@ class DroidCfg:
         prim_path="{ENV_REGEX_NS}/robot/Gripper/Robotiq_2F_85/base_link/wrist_cam",
         height=720,
         width=1280,
-        data_types=["rgb"],
+        data_types=["rgb", "distance_to_image_plane"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=2.8,
             focus_distance=28.0,

@@ -135,7 +135,7 @@ When the plan finishes executing, the env is frozen and its recording is exporte
 
 ### Install the server
 
-Clone and follow install instructions in the [`tiptop-robot`](https://github.com/tiptop-robot/tiptop-robot) repo. **Do not** install TipTop in the RoboLab venv — it runs as a separate process.
+Clone and follow the pixi-based install instructions in the [`tiptop`](https://github.com/tiptop-robot/tiptop) repo. **Do not** install TipTop in the RoboLab venv — it runs as a separate process under its own pixi environment.
 
 ### Start the policy server
 
