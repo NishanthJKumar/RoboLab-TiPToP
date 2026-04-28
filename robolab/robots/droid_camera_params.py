@@ -8,7 +8,6 @@ addition to RGB. Safe to include on envs whose policies only read RGB — the
 extra terms are ignored.
 """
 
-import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -21,11 +20,7 @@ def wrist_cam_depth(
 ):
     """Wrist camera depth image (distance to image plane)."""
     sensor = env.scene[sensor_cfg.name]
-    try:
-        return sensor.data.output["distance_to_image_plane"]
-    except (RuntimeError, KeyError):
-        h, w = sensor.cfg.height, sensor.cfg.width
-        return torch.zeros((env.num_envs, h, w, 1), device=env.device, dtype=torch.float32)
+    return sensor.data.output["distance_to_image_plane"]
 
 
 def wrist_cam_intrinsics(
