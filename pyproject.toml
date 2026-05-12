@@ -34,6 +34,7 @@ dependencies = [
     "tqdm",
     "tyro",
     "python-dotenv",
+    "google-genai>=1.0.0,<1.65.0",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +53,9 @@ include = ["robolab", "robolab.*"]
 [tool.uv]
 prerelease = "allow"
 index-strategy = "unsafe-best-match"
+# isaacsim==5.0.0 pins websockets==12.0, but google-genai>=1.0 needs >=13.
+# Override to the wider bound — the source prompt-harness repo does the same.
+override-dependencies = ["websockets>=12.0"]
 
 [tool.uv.extra-build-dependencies]
 flatdict = ["setuptools<81"]
