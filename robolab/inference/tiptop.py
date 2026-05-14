@@ -66,6 +66,14 @@ class TiptopWebsocketClient(InferenceClient):
         self._last_gripper_state: float = 0.0
         self._last_planning_time: Optional[float] = None  # seconds, from server response
 
+        # Label of the plan step currently being executed (e.g. "Pick(banana, grasp1, q1)").
+        # Updated whenever a new plan step is loaded; cleared to None when the plan ends.
+        # Note: tracked separately from `_current_plan_step` because that counter is
+        # asymmetric — it advances on trajectory load (line ~322) but only on gripper
+        # *completion* (line ~286), so it doesn't always point at the step currently
+        # being executed.
+        self._executing_label: Optional[str] = None
+
         self._connect()
 
     def _connect(self, max_retries: int = 12) -> None:
@@ -94,6 +102,17 @@ class TiptopWebsocketClient(InferenceClient):
         return self._last_planning_time
 
     @property
+    def current_subtask_label(self) -> Optional[str]:
+        """Label of the plan step currently being executed (e.g. "Pick(banana, grasp1, q1)"),
+        or None if no plan is loaded or the plan has finished.
+
+        Useful for execution monitoring: an episode runner can detect transitions in
+        this label across `infer()` calls to know when a Pick/Place subtask boundary
+        has been crossed, without having to infer it from the gripper signal.
+        """
+        return self._executing_label
+
+    @property
     def plan_done(self) -> bool:
         """True when the full plan has been executed."""
         if self._plan is None:
@@ -116,6 +135,7 @@ class TiptopWebsocketClient(InferenceClient):
         self._gripper_action_steps_remaining = 0
         self._last_gripper_state = 0.0
         self._last_planning_time = None
+        self._executing_label = None
         # Reconnect to get a fresh server-side handler (avoids stale cuTAMP state)
         if self._ws is not None:
             self._ws.close()
@@ -291,6 +311,7 @@ class TiptopWebsocketClient(InferenceClient):
         ):
             # Plan completed — hold position
             if self._plan is None or self._current_plan_step >= len(self._plan):
+                self._executing_label = None
                 joint_pos = curr_obs["joint_position"]
                 gripper_val = (
                     curr_obs["gripper_position"][0]
@@ -301,6 +322,7 @@ class TiptopWebsocketClient(InferenceClient):
                 return self._make_result(action, curr_obs)
 
             step = self._plan[self._current_plan_step]
+            self._executing_label = step.get("label")
 
             if step["type"] == "gripper":
                 self._gripper_action_pending = step["action"]
