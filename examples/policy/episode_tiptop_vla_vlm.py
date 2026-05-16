@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 
 import cv2
@@ -280,6 +281,36 @@ def run_episode_tiptop_vla_vlm(
     plan_done_logged: bool = False
     actual_steps: int = 0
 
+    # Isaac Sim / kit installs its own SIGINT handler that swallows the default
+    # Ctrl-C → KeyboardInterrupt path, so the episode runner never exits and the
+    # finally block (video release, JSON dump) never fires. Install our own
+    # handler that sets a flag the main loop checks, and restore the previous
+    # handler in finally. Second Ctrl-C escalates to raising KeyboardInterrupt
+    # so the user can still force-kill if cleanup itself hangs.
+    interrupted = {"count": 0}
+    prev_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def _on_sigint(signum, frame):
+        interrupted["count"] += 1
+        if interrupted["count"] == 1:
+            print(
+                "\n\033[93m[Harness] Ctrl-C received — finishing current step then "
+                "shutting down cleanly (videos + logs). Press Ctrl-C again to force.\033[0m",
+                flush=True,
+            )
+        else:
+            print(
+                "\n\033[91m[Harness] Second Ctrl-C — raising KeyboardInterrupt (may skip cleanup).\033[0m",
+                flush=True,
+            )
+            raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        # Non-main thread or platform restriction — signal install isn't critical,
+        # the launcher's KeyboardInterrupt fallback still works.
+        prev_sigint_handler = None
+
     hlog(f"Instruction: \"{instruction}\"")
     hlog(f"TipTop server: {tiptop_host}:{tiptop_port}  |  VLA server: {vla_host}:{vla_port}")
     hlog(
@@ -360,8 +391,16 @@ def run_episode_tiptop_vla_vlm(
     try:
         for step in tqdm(range(max_steps)):
 
+            if interrupted["count"] > 0:
+                hlog("Loop exit triggered by SIGINT.", color="\033[93m")
+                break
+
             while not timeline.is_playing():
                 kit_app.update()
+                if interrupted["count"] > 0:
+                    break
+            if interrupted["count"] > 0:
+                break
 
             # ---------------------------------------------------------------
             # Resolve the action for this step (and the active mode).
@@ -839,6 +878,14 @@ def run_episode_tiptop_vla_vlm(
             if env.all_terminated:
                 break
     finally:
+        # Restore the previous SIGINT handler so we don't leak our handler into
+        # subsequent code (e.g. summarize_experiment_results in the launcher).
+        if prev_sigint_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, prev_sigint_handler)
+            except (ValueError, OSError):
+                pass
+
         # MOST critical first: finalize video files so a Ctrl-C still leaves
         # playable output of whatever the agent did up to the abort. cv2's
         # VideoWriter buffers frames internally; without release() the .mp4
