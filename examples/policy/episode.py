@@ -52,7 +52,7 @@ from robolab.core.utils.video_utils import VideoWriter
 from robolab.core.world.world_state import get_world
 
 
-def run_episode(env, env_cfg, episode, headless=False, save_videos=True, video_mode="all", remote_host="localhost", remote_port="8000"):
+def run_episode(env, env_cfg, episode, headless=False, save_videos=True, video_mode="all", remote_host="localhost", remote_port="8000", tiptop_gripper_steps=20, tiptop_waypoint_stride=None):
     """Run a policy-controlled episode across all parallel envs.
 
     Args:
@@ -109,7 +109,15 @@ def run_episode(env, env_cfg, episode, headless=False, save_videos=True, video_m
     subtask_status = []
 
     # Single client (one WebSocket connection) with per-env chunk state
-    client = PolicyClient(remote_host=remote_host, remote_port=remote_port)
+    if backend == "tiptop":
+        client = PolicyClient(
+            remote_host=remote_host,
+            remote_port=remote_port,
+            gripper_action_steps=tiptop_gripper_steps,
+            waypoint_stride=tiptop_waypoint_stride,
+        )
+    else:
+        client = PolicyClient(remote_host=remote_host, remote_port=remote_port)
     clients = [client] * env.num_envs
 
     # Set up per-run HDF5 file and per-env demo indices

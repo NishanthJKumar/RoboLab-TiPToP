@@ -3,32 +3,28 @@
 # isort: skip_file
 
 """
-Run policy evaluation across multiple tasks.
+Run TipTop + VLA + VLM hybrid evaluation.
 
-This script runs policy evaluation on multiple registered tasks, supporting various
-policy backends (pi0, etc.) with options for subtask tracking and result logging.
+Tries TipTop first; on planning failure or per-Pick/Place VLM failure, drops
+to a single combined-pick+place VLA recovery picked by the VLM; after each
+recovery subtask completes (or times out) retries TipTop from the current
+state. Saved videos overlay a colored mode banner so the viewer can see when
+control switches between TipTop and the VLA.
 
-Supports multi-env: each "run" spawns num_envs parallel episodes.
-Total episodes = num_runs * num_envs.
+Single-env only (TipTop limitation). Requires:
+    - GEMINI_API_KEY (or GOOGLE_API_KEY) for the Gemini VLM
+    - A running TipTop websocket server (default port 8765)
+    - A running VLA policy server (default port 8000)
 
 Usage:
-    Run on all registered tasks:
-    $ python run_eval.py
-
-    Run on specific tasks:
-    $ python run_eval.py --task BananaInBowlTask RubiksCubeTask
-
-    Run on a tag:
-    $ python run_eval.py --tag spatial
-
-    Use specific policy:
-    $ python run_eval.py --policy pi05
-
-    Run multiple episodes with 2 parallel envs:
-    $ python run_eval.py --num-runs 2 --num_envs 4
-
-Output:
-    Results are saved to: output/<output_folder_name>/
+    uv run python examples/policy/run_eval_tiptop_vla_vlm.py \\
+        --task BananaOnPlateTask --num-envs 1 \\
+        --tiptop-host luma02.csail.mit.edu --tiptop-port 8765 \\
+        --vla-host luma02.csail.mit.edu --vla-port 8000 \\
+        --vla-policy pi05 --headless --video-mode all \\
+        --tiptop-vlm-check-delay-steps 10 \\
+        --vla-vlm-check-every-n-steps 15 \\
+        --vla-subtask-timeout-steps 150
 """
 
 import argparse
@@ -41,63 +37,101 @@ from collections import Counter
 from isaaclab.app import AppLauncher
 from robolab.constants import get_timestamp, DEFAULT_TASK_SUBFOLDERS # noqa
 
-# add argparse arguments
 parser = argparse.ArgumentParser(description="")
-parser.add_argument("--num-envs", "--num_envs", type=int, default=1, help="Number of environments to spawn.")
-# append AppLauncher cli args
+parser.add_argument("--num-envs", "--num_envs", type=int, default=1,
+                    help="Number of environments to spawn. Must be 1 — TipTop is single-env only.")
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument("--task", nargs='+', default=None,
-                       help="List of tasks to evaluate on ")
+                    help="List of tasks to evaluate on")
 parser.add_argument("--tag", nargs='+', default=None,
-                       help="List of tags of tasks to evaluate on ")
+                    help="List of tags of tasks to evaluate on")
 parser.add_argument("--task-dirs", nargs='+', default=DEFAULT_TASK_SUBFOLDERS,
-                       help="List of task directories to evaluate on")
-parser.add_argument("--policy",
-                    choices=["pi0", "pi0_fast", "paligemma", "paligemma_fast", "pi05", "gr00t", "dreamzero", "molmo", "openvla", "openvla_oft", "tiptop"], default="pi05",
-                       help="Action-prediction backend to use (default: pi05). For 'tiptop' pass --remote-port 8765 and --num-envs 1.")
+                    help="List of task directories to evaluate on")
+parser.add_argument("--vla-policy", "--vla_policy",
+                    choices=["pi0", "pi0_fast", "paligemma", "paligemma_fast", "pi05",
+                             "gr00t", "dreamzero", "molmo", "openvla", "openvla_oft"],
+                    default="pi05",
+                    help="VLA backend used as the recovery executor (default: pi05). "
+                         "TipTop is always the primary planner.")
 parser.add_argument("--num-runs", "--num_runs", type=int, default=1,
-                       help="Number of sequential runs per task (default: 1). Total episodes = num_runs * num_envs. Prefer increasing --num_envs for more episodes. Only increase --num-runs if you run out of GPU memory with the desired num_envs.")
+                    help="Number of sequential runs per task (default: 1).")
 parser.add_argument("--enable-subtask", "--enable_subtask", action="store_true",
-                       help="Enable subtask progress checking (default: False)")
+                    help="Enable subtask progress checking (default: False)")
 parser.add_argument("--record-image-data", "--record_image_data", action="store_true",
-                       help="Enable proprio image data recording (default: False)")
+                    help="Enable proprio image data recording (default: False)")
 parser.add_argument("--output-folder-name", "--output_folder_name", type=str, default=None,
-                       help="Output folder name under /robolab/output. Default is <timestamp>_<policy>. If you provide the output folder name for a previous run, the script will skip the tasks and episodes that have already been run.")
+                    help="Output folder name under /robolab/output. "
+                         "Default is <timestamp>_tiptop_vla_vlm_<policy>.")
 parser.add_argument("--enable-verbose", "--enable_verbose", action="store_true",
-                       help="Verbose output (default: False)")
+                    help="Verbose output (default: False)")
 parser.add_argument("--enable-debug", "--enable_debug", action="store_true",
-                       help="Debug output (default: False)")
-parser.add_argument("--remote-host", "--remote_host", type=str, default="localhost",
-                       help="Remote host for policy server (default: localhost)")
-parser.add_argument("--remote-port", "--remote_port", type=int, default=8000,
-                       help="Remote port for policy server (default: 8000)")
+                    help="Debug output (default: False)")
+parser.add_argument("--tiptop-host", "--tiptop_host", type=str, default="localhost",
+                    help="Remote host for the TipTop websocket server (default: localhost).")
+parser.add_argument("--tiptop-port", "--tiptop_port", type=int, default=8765,
+                    help="Remote port for the TipTop websocket server (default: 8765).")
+parser.add_argument("--vla-host", "--vla_host", type=str, default="localhost",
+                    help="Remote host for the VLA policy server (default: localhost).")
+parser.add_argument("--vla-port", "--vla_port", type=int, default=8000,
+                    help="Remote port for the VLA policy server (default: 8000).")
 parser.add_argument("--instruction-type", "--instruction_type", type=str, default="default",
-                       help="Which instruction variant to use when a task defines multiple (default, vague, specific, etc.)")
+                    help="Which instruction variant to use when a task defines multiple")
 parser.add_argument("--video-mode", "--video_mode", type=str, default="all",
                     choices=["all", "viewport", "sensor", "none"],
-                    help="Which videos to save: 'all' (sensor + viewport), 'viewport' only, 'sensor' only, or 'none' (default: all)")
-parser.add_argument("--episode-length-s", "--episode_length_s", type=float, default=None,
-                    help="Override env_cfg.episode_length_s (in seconds) before each episode. "
-                         "Changes env.max_episode_length and the time_out termination accordingly. "
-                         "Defaults to the task's built-in value.")
+                    help="Which videos to save (default: all)")
+# --- TipTop-side VLM args ---
+parser.add_argument("--tiptop-vlm-check-delay-steps", "--tiptop_vlm_check_delay_steps",
+                    type=int, default=10,
+                    help="(TipTop mode) Sim steps to wait after a TipTop Pick/Place subtask "
+                         "boundary before running the VLM check on that subtask (default: 10). "
+                         "Just needs to cover settling time.")
+# --- VLA-side VLM args ---
+parser.add_argument("--vla-vlm-check-every-n-steps", "--vla_vlm_check_every_n_steps",
+                    type=int, default=15,
+                    help="(VLA-recovery mode) How often (in VLA policy steps) to ask the VLM "
+                         "whether the current recovery pick+place is done (default: 15).")
+parser.add_argument("--vla-subtask-timeout-steps", "--vla_subtask_timeout_steps",
+                    type=int, default=150,
+                    help="(VLA-recovery mode) Max VLA steps on one recovery subtask before it "
+                         "is force-completed and TipTop is retried (default: 150).")
+# --- Shared VLM args (apply to both TipTop boundary checks and VLA-recovery checks) ---
+parser.add_argument("--vlm-model", "--vlm_model", type=str, default="gemini-robotics-er-1.6-preview",
+                    help="(Shared) Gemini model id used for both TipTop boundary checks and "
+                         "VLA-recovery completion/recovery-subtask prompts.")
+parser.add_argument("--vlm-verbose", "--vlm_verbose", action="store_true",
+                    help="(Shared) Save raw VLM responses in vlm_checks_*.json (default: False).")
+parser.add_argument("--save-vlm-debug-images", "--save_vlm_debug_images", action="store_true",
+                    help="(Shared) Save frames sent to the VLM under vlm_debug_<episode>/ for "
+                         "offline debugging (default: False).")
 parser.add_argument("--tiptop-waypoint-stride", "--tiptop_waypoint_stride", type=int, default=None,
-                    help="(TipTop only) Override the trajectory waypoint stride (default: "
-                         "derived from sim/CuRobo Hz, typically 3). Higher = faster arm motion; "
-                         "may saturate the joint controller's velocity/accel limits if pushed "
-                         "too high.")
+                    help="Override the TipTop client's trajectory waypoint stride "
+                         "(default: derived from sim/CuRobo Hz, typically 3).")
 parser.add_argument("--tiptop-gripper-steps", "--tiptop_gripper_steps", type=int, default=20,
-                    help="(TipTop only) Sim steps to hold the gripper command during each "
-                         "Pick/Place gripper step (default: 20, ~1.3s at 15Hz). Lower = faster "
-                         "gripper actuation.")
-# parse the arguments
+                    help="Sim steps to hold the gripper command during each Pick/Place gripper "
+                         "step (default: 20, ~1.3s at 15Hz).")
+parser.add_argument("--home-pose-steps", "--home_pose_steps", type=int, default=30,
+                    help="Sim steps to drive the arm to a canonical home pose (gripper open) "
+                         "before re-querying TipTop after VLA recovery or a plan completion that "
+                         "didn't achieve the overall goal (default: 30, ~2s at 15Hz). Set to 0 "
+                         "to skip homing.")
+parser.add_argument("--episode-length-s", "--episode_length_s", type=float, default=None,
+                    help="Override env_cfg.episode_length_s (in seconds) before each episode.")
+
 args_cli, _= parser.parse_known_args()
 args_cli.enable_cameras = True
 args_cli.save_videos = args_cli.video_mode != "none"
+
+if args_cli.num_envs != 1:
+    raise SystemExit(
+        f"TipTop+VLA+VLM requires --num-envs 1 (got {args_cli.num_envs}). "
+        "TipTop is single-env only."
+    )
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 from robolab.constants import PACKAGE_DIR, set_output_dir # noqa
-from episode import run_episode # noqa
+from episode_tiptop_vla_vlm import run_episode_tiptop_vla_vlm # noqa
 from robolab.core.environments.runtime import create_env # noqa
 from robolab.core.logging.recorder_manager import patch_recorder_manager # noqa
 from robolab.core.environments.factory import get_envs # noqa
@@ -110,25 +144,26 @@ from robolab.core.task.status import StatusCode, get_status_name # noqa
 from robolab.core.utils.file_utils import load_file # noqa
 import robolab.constants # noqa
 
-# Update robolab.constants module settings from command line arguments
 robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING = args_cli.enable_subtask
 robolab.constants.RECORD_IMAGE_DATA = args_cli.record_image_data
 robolab.constants.VERBOSE = args_cli.enable_verbose
 robolab.constants.DEBUG = args_cli.enable_debug
 
-# Fix recorder manager
 patch_recorder_manager()
 
-# Run automatic factory generation before main
+# TipTop needs wrist depth + intrinsics + extrinsics (enable_camera_params=True),
+# AND the VLA needs the external_cam in image_obs (keep_external_cam=True). The TipTop
+# path normally drops external_cam to save VRAM; we opt back in here because the hybrid
+# needs both observations live in the same episode.
 from robolab.registrations.droid_jointpos.auto_env_registrations import auto_register_droid_envs # noqa
-# TipTop needs wrist-camera depth + intrinsics + extrinsics. Enabling this for
-# other policies roughly doubles wrist-camera VRAM (it adds distance_to_image_plane
-# to the TiledCamera), which OOMs at high --num-envs. Keep it gated.
 auto_register_droid_envs(
     task_dirs=args_cli.task_dirs,
     task=args_cli.task,
-    enable_camera_params=(args_cli.policy == "tiptop"),
+    enable_camera_params=True,
+    keep_external_cam=True,
 )
+
+METHOD_LABEL = f"tiptop+vla+vlm_{args_cli.vla_policy}"
 
 EVENT_STATUS_CODES = {
     StatusCode.WRONG_OBJECT_GRABBED_FAILURE,
@@ -144,8 +179,8 @@ EVENT_STATUS_CODES = {
     StatusCode.GRIPPER_FULLY_CLOSED,
 }
 
+
 def _extract_events_from_log(log_file: str) -> dict:
-    """Extract error events from a log file. Returns dict of event counts and details."""
     if not os.path.exists(log_file):
         return {}
 
@@ -185,10 +220,16 @@ def _extract_events_from_log(log_file: str) -> dict:
 
     return events
 
+
 def main():
-    """Main function."""
+    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        raise RuntimeError(
+            "Neither GEMINI_API_KEY nor GOOGLE_API_KEY is set. "
+            "Export one before running the TipTop+VLA+VLM script."
+        )
+
     if args_cli.output_folder_name is None:
-        args_cli.output_folder_name = get_timestamp() + f"_{args_cli.policy}"
+        args_cli.output_folder_name = get_timestamp() + f"_tiptop_vla_vlm_{args_cli.vla_policy}"
         if args_cli.instruction_type != "default":
             args_cli.output_folder_name += f"_{args_cli.instruction_type}"
 
@@ -214,7 +255,7 @@ def main():
         filter_str=filter_str,
         num_envs=num_envs,
         num_episodes=total_episodes,
-        policy=args_cli.policy,
+        policy=METHOD_LABEL,
         instruction_type=args_cli.instruction_type,
         output_dir=output_dir,
     )
@@ -230,12 +271,17 @@ def main():
             print(f"\033[96m[RoboLab] Task `{task_env}` already done. Skipping.\033[0m")
             continue
 
+        # Pass the VLA backend as the `policy` arg so env_cfg.policy is set to the VLA
+        # name — the episode runner reads it to select the right VLA client class. The
+        # env still gets TipTop-style camera_params_obs because the auto_register call
+        # above sets enable_camera_params=True (with keep_external_cam=True so the VLA
+        # also gets the third-person external view).
         env, env_cfg = create_env(task_env,
             device=args_cli.device,
             num_envs=num_envs,
             use_fabric=True,
             instruction_type=args_cli.instruction_type,
-            policy=args_cli.policy)
+            policy=args_cli.vla_policy)
 
         if args_cli.episode_length_s is not None:
             env.cfg.episode_length_s = args_cli.episode_length_s
@@ -243,35 +289,45 @@ def main():
                   f"(max_episode_length now {env.max_episode_length} steps)\033[0m")
 
         for run_idx in range(num_runs):
-
-            # Check if all episodes in this run are already complete
             run_episode_ids = [run_idx * num_envs + eid for eid in range(num_envs)]
             if all(check_run_complete(episode_results=episode_results, env_name=task_env, episode=ep_id) for ep_id in run_episode_ids):
                 print(f"\033[96m[RoboLab] Task `{task_env}` run `{run_idx}` already done. Skipping.\033[0m")
                 continue
 
-            # Policy
             if args_cli.instruction_type != "default":
                 run_name = task_env + f"_{args_cli.instruction_type}_{run_idx}"
             else:
                 run_name = task_env + f"_{run_idx}"
-            print(f"\033[96m[RoboLab] Running {run_name}: '{env_cfg.instruction}' (run {run_idx}, {num_envs} envs)\033[0m")
+            print(f"\033[96m[RoboLab] Running {run_name}: '{env_cfg.instruction}' "
+                  f"(run {run_idx}, TipTop+VLA+VLM hybrid, vla_policy={args_cli.vla_policy})\033[0m")
+            print(f"\033[96m[RoboLab] TipTop server {args_cli.tiptop_host}:{args_cli.tiptop_port}  "
+                  f"|  VLA server {args_cli.vla_host}:{args_cli.vla_port}  "
+                  f"|  VLM {args_cli.vlm_model}\033[0m")
 
-            env_results, msgs, timing = run_episode(env=env,
-                        env_cfg=env_cfg,
-                        episode=run_idx,
-                        save_videos=args_cli.save_videos,
-                        video_mode=args_cli.video_mode,
-                        headless=args_cli.headless,
-                        remote_host=args_cli.remote_host,
-                        remote_port=args_cli.remote_port,
-                        tiptop_gripper_steps=args_cli.tiptop_gripper_steps,
-                        tiptop_waypoint_stride=args_cli.tiptop_waypoint_stride)
+            env_results, msgs, timing = run_episode_tiptop_vla_vlm(
+                env=env,
+                env_cfg=env_cfg,
+                episode=run_idx,
+                save_videos=args_cli.save_videos,
+                video_mode=args_cli.video_mode,
+                headless=args_cli.headless,
+                tiptop_host=args_cli.tiptop_host,
+                tiptop_port=args_cli.tiptop_port,
+                vla_host=args_cli.vla_host,
+                vla_port=args_cli.vla_port,
+                vlm_check_delay_steps=args_cli.tiptop_vlm_check_delay_steps,
+                check_every_n_steps=args_cli.vla_vlm_check_every_n_steps,
+                subtask_timeout_steps=args_cli.vla_subtask_timeout_steps,
+                vlm_model=args_cli.vlm_model,
+                vlm_verbose=args_cli.vlm_verbose,
+                save_vlm_debug_images=args_cli.save_vlm_debug_images,
+                tiptop_gripper_steps=args_cli.tiptop_gripper_steps,
+                tiptop_waypoint_stride=args_cli.tiptop_waypoint_stride,
+                home_pose_steps=args_cli.home_pose_steps,
+            )
 
-            # Get per-env final info for incomplete episodes
-            final_infos = get_final_subtask_info(env, env_id=None)  # list[dict | None]
+            final_infos = get_final_subtask_info(env, env_id=None)
 
-            # Split msgs (list[list[dict] | None]) into per-env log streams
             per_env_msgs: dict[int, list] = {eid: [] for eid in range(num_envs)}
             for step_infos in msgs:
                 if step_infos is None:
@@ -281,7 +337,6 @@ def main():
                     for eid in range(num_envs):
                         per_env_msgs[eid].append(step_infos[eid] if eid < len(step_infos) else None)
 
-            # Write per-env log files and extract per-env events
             per_env_events: dict[int, dict] = {}
             for eid in range(num_envs):
                 log_file = os.path.join(scene_output_dir, f"log_{run_idx}_env{eid}.json")
@@ -290,12 +345,10 @@ def main():
 
             dt = env_cfg.sim.dt * env_cfg.decimation
 
-            # Emit one run_summary per env
             for r in env_results:
                 env_id = r['env_id']
                 episode_id = run_idx * num_envs + env_id
 
-                # Compute trajectory metrics from per-run HDF5
                 hdf5_path = os.path.join(scene_output_dir, f"run_{run_idx}.hdf5")
                 demo_key = f"demo_{env_id}"
                 traj_data = load_demo_data(hdf5_path, demo_key)
@@ -310,7 +363,7 @@ def main():
                     "run": run_idx,
                     "episode": episode_id,
                     "env_id": env_id,
-                    "policy": args_cli.policy,
+                    "policy": METHOD_LABEL,
                     "instruction": env_cfg.instruction,
                     "instruction_type": args_cli.instruction_type,
                     "attributes": env_cfg._task_attributes,
@@ -325,7 +378,6 @@ def main():
 
                 if robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING:
                     env_msgs = per_env_msgs.get(env_id, [])
-                    # Find last non-None msg for this env
                     last_msg = None
                     for m in reversed(env_msgs):
                         if m is not None:
@@ -339,20 +391,16 @@ def main():
                         run_summary["score"] = None
                         run_summary["reason"] = None
 
-                    # For failed episodes, use per-env final_info
                     final_info = final_infos[env_id] if final_infos else None
                     if not r['success'] and final_info is not None:
                         run_summary["reason"] = final_info.get("info", run_summary.get("reason"))
 
                 episode_results = update_experiment_results(run_summary=run_summary, episode_results=episode_results, episode_results_file=episode_results_file)
 
-            # Reset eval state for next run (unfreeze all envs)
             env.reset_eval_state()
 
         env.close()
 
-    # This will print the results to the terminal, summarized.
-    # Alternatively, you can run `python analysis/read_results.py <output_dir>` to read the results from the file.
     summarize_experiment_results(episode_results, show_timing=True)
 
     simulation_app.close()
@@ -361,6 +409,16 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        # Caught explicitly so simulation_app.close() runs even on Ctrl-C.
+        # The episode runner's finally block already finalized the videos and
+        # flushed the recorder; here we just shut the sim down cleanly.
+        print("\033[96m[RoboLab] Interrupted by user (Ctrl-C). Shutting down.\033[0m")
+        try:
+            simulation_app.close()
+        except Exception:
+            pass
+        sys.exit(130)  # 128 + SIGINT
     except Exception as e:
         print(f"\033[96m[RoboLab] Terminated with error: {e}\033[0m")
         traceback.print_exc()

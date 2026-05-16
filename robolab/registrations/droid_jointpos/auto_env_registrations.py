@@ -24,7 +24,7 @@ The columns are:
 - Tags: Tag names this environment belongs to
 
 """
-def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensity=None, task=None, enable_camera_params=False):
+def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensity=None, task=None, enable_camera_params=False, keep_external_cam=False):
     """Automatically discover and register tasks.
 
     Args:
@@ -37,6 +37,13 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
               observations (required by TipTop). Off by default because adding
               ``distance_to_image_plane`` to the tiled wrist camera roughly doubles its
               render-buffer VRAM cost, which pushes high ``num_envs`` runs out of memory.
+        keep_external_cam: When ``enable_camera_params=True`` is set, the TipTop path
+              normally drops ``external_cam`` from ``image_obs`` to save VRAM. Set this
+              to True to keep ``external_cam`` alongside the camera-params obs — needed
+              by the hybrid TipTop+VLA runner, where TipTop wants wrist depth/intrinsics
+              and the VLA wants the third-person external view in the same episode.
+              Ignored when ``enable_camera_params=False`` (external_cam is included by
+              default in that path).
     """
     from robolab.core.environments.factory import auto_discover_and_create_cfgs, create_env_cfg
     from robolab.core.observations.observation_utils import generate_image_obs_from_cameras, generate_obs_cfg
@@ -79,8 +86,9 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
                 self.enable_corruption = False
                 self.concatenate_terms = False
 
+        image_obs_cfg = ImageObsCfg() if keep_external_cam else WristOnlyImageObsCfg()
         obs_groups = {
-            "image_obs": WristOnlyImageObsCfg(),
+            "image_obs": image_obs_cfg,
             "proprio_obs": ProprioceptionObservationCfg(),
             "viewport_cam": ViewportCameraCfg(),
         }
@@ -104,7 +112,11 @@ def auto_register_droid_envs(task_dirs=DEFAULT_TASK_SUBFOLDERS, lighting_intensi
         robot_cfg_cls = DroidCfgWithWristDepth
         obs_groups["camera_params_obs"] = CameraParamsObservationCfg()
 
-        camera_cfg = [EgocentricMirroredCameraCfg]
+        camera_cfg = (
+            [OverShoulderLeftCameraCfg, EgocentricMirroredCameraCfg]
+            if keep_external_cam
+            else [EgocentricMirroredCameraCfg]
+        )
     else:
         obs_groups = {
             "image_obs": ImageObsCfg(),

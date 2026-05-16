@@ -79,6 +79,14 @@ parser.add_argument("--save-vlm-debug-images", "--save_vlm_debug_images", action
                     help="For each gripper event, save the frame at the transition step AND "
                          "the frame at the VLM-check step to vlm_debug_<episode>/ for offline "
                          "debugging (default: False).")
+parser.add_argument("--tiptop-waypoint-stride", "--tiptop_waypoint_stride", type=int, default=None,
+                    help="Override the TipTop client's trajectory waypoint stride (default: "
+                         "derived from sim/CuRobo Hz, typically 3). Higher = faster arm motion; "
+                         "may saturate the joint controller's velocity/accel limits if pushed "
+                         "too high.")
+parser.add_argument("--tiptop-gripper-steps", "--tiptop_gripper_steps", type=int, default=20,
+                    help="Sim steps to hold the gripper command during each Pick/Place gripper "
+                         "step (default: 20, ~1.3s at 15Hz). Lower = faster gripper actuation.")
 parser.add_argument("--episode-length-s", "--episode_length_s", type=float, default=None,
                     help="Override env_cfg.episode_length_s (in seconds) before each episode.")
 
@@ -270,7 +278,9 @@ def main():
                         vlm_check_delay_steps=args_cli.vlm_check_delay_steps,
                         vlm_model=args_cli.vlm_model,
                         vlm_verbose=args_cli.vlm_verbose,
-                        save_vlm_debug_images=args_cli.save_vlm_debug_images)
+                        save_vlm_debug_images=args_cli.save_vlm_debug_images,
+                        tiptop_gripper_steps=args_cli.tiptop_gripper_steps,
+                        tiptop_waypoint_stride=args_cli.tiptop_waypoint_stride)
 
             final_infos = get_final_subtask_info(env, env_id=None)
 

@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: CC-BY-NC-4.0
 
+import msgpack
 import numpy as np
-from openpi_client import image_tools, websocket_client_policy
+from openpi_client import image_tools, msgpack_numpy as _openpi_msgpack_numpy, websocket_client_policy
 from PIL import Image
 
 from .base_client import InferenceClient
@@ -18,6 +19,18 @@ class Pi0DroidJointposClient(InferenceClient):
         print(f"[{self.__class__.__name__}] Awaiting for server on {remote_host}:{remote_port} to be ready...")
         self.client = websocket_client_policy.WebsocketClientPolicy(
             remote_host, remote_port
+        )
+        # Force the openpi-client packer to use openpi's `pack_array` encoder
+        # directly, bypassing any global `msgpack.Packer` monkey-patches that may
+        # have been applied elsewhere in the process (e.g. by PyPI msgpack_numpy's
+        # `patch()`). Without this, the wrapping `functools.partial` can resolve
+        # to the patched encoder and produce a dict shape the openpi server can't
+        # decode (`{b'nd', b'type', b'kind', b'shape', b'data'}` instead of
+        # `{b'__ndarray__', b'data', b'dtype', b'shape'}`).
+        self.client._packer = msgpack.Packer(
+            default=_openpi_msgpack_numpy.pack_array,
+            autoreset=True,
+            use_bin_type=True,
         )
         print(f"[{self.__class__.__name__}] Server on {remote_host}:{remote_port} is ready.")
 
@@ -89,10 +102,14 @@ class Pi0DroidJointposClient(InferenceClient):
         right_image = obs_dict["image_obs"]["external_cam"][env_id].clone().detach().cpu().numpy()
         wrist_image = obs_dict["image_obs"]["wrist_cam"][env_id].clone().detach().cpu().numpy()
 
-        # Capture proprioceptive state
+        # Capture proprioceptive state. Force 1-D shapes so the openpi server's
+        # droid_policy.DroidInputs (which does `np.concatenate([joint_position, gripper_pos])`)
+        # never sees a 0-d scalar — that path raises "zero-dimensional arrays cannot be
+        # concatenated" when the env happens to expose proprio terms with a missing
+        # trailing dim (e.g. (num_envs,) instead of (num_envs, k)).
         robot_state = obs_dict["proprio_obs"]
-        joint_position = robot_state["arm_joint_pos"][env_id].clone().detach().cpu().numpy()
-        gripper_position = robot_state["gripper_pos"][env_id].clone().detach().cpu().numpy()
+        joint_position = robot_state["arm_joint_pos"][env_id].clone().detach().cpu().numpy().reshape(-1)
+        gripper_position = robot_state["gripper_pos"][env_id].clone().detach().cpu().numpy().reshape(-1)
 
         if save_to_disk:
             combined_image = np.concatenate([right_image, wrist_image], axis=1)

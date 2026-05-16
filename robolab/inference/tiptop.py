@@ -25,7 +25,13 @@ from scipy.spatial.transform import Rotation
 from .base_client import InferenceClient
 
 _log = logging.getLogger(__name__)
-msgpack_numpy.patch()
+
+# NOTE: do NOT call `msgpack_numpy.patch()` here. It monkey-patches msgpack.Packer/
+# Unpacker/packb/unpackb globally, which breaks openpi-client's encoder selection
+# in any same-process caller (e.g. the TipTop+VLA+VLM hybrid that uses both
+# tiptop here and pi05 via openpi-client). The TipTop protocol below already uses
+# `msgpack_numpy.Packer()` / `msgpack_numpy.unpackb(...)` explicitly, which works
+# regardless of whether the global patch is applied.
 
 
 class PlanningError(Exception):
@@ -42,16 +48,23 @@ class TiptopWebsocketClient(InferenceClient):
         gripper_action_steps: int = 20,
         sim_control_hz: float = 15.0,
         curobo_interp_hz: float = 50.0,
+        waypoint_stride: Optional[int] = None,
     ) -> None:
         self._uri = f"ws://{remote_host}:{remote_port}"
         self._gripper_action_steps = gripper_action_steps
 
-        # CuRobo default interp rate is ~50 Hz; sim runs at 15 Hz → skip ~3 waypoints per step
-        self._waypoint_stride = max(1, int(round(curobo_interp_hz / sim_control_hz)))
-        _log.info(
-            f"Waypoint stride: {self._waypoint_stride} "
-            f"(curobo={curobo_interp_hz}Hz, sim={sim_control_hz}Hz)"
-        )
+        # CuRobo default interp rate is ~50 Hz; sim runs at 15 Hz → skip ~3 waypoints per step.
+        # An explicit `waypoint_stride` overrides this — useful for sweeping playback
+        # speed without touching the underlying Hz numbers.
+        if waypoint_stride is not None:
+            self._waypoint_stride = max(1, int(waypoint_stride))
+            _log.info(f"Waypoint stride: {self._waypoint_stride} (override)")
+        else:
+            self._waypoint_stride = max(1, int(round(curobo_interp_hz / sim_control_hz)))
+            _log.info(
+                f"Waypoint stride: {self._waypoint_stride} "
+                f"(curobo={curobo_interp_hz}Hz, sim={sim_control_hz}Hz)"
+            )
 
         self._ws: Optional[websockets.sync.client.ClientConnection] = None
         self._server_metadata: dict = {}

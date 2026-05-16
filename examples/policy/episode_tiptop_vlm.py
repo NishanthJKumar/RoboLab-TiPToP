@@ -152,6 +152,8 @@ def run_episode_tiptop_vlm(
     vlm_model: str = "gemini-robotics-er-1.6-preview",
     vlm_verbose: bool = False,
     save_vlm_debug_images: bool = False,
+    tiptop_gripper_steps: int = 20,
+    tiptop_waypoint_stride: int | None = None,
 ):
     """Run a TipTop-driven episode with passive VLM auditing of planner subtasks.
 
@@ -178,7 +180,12 @@ def run_episode_tiptop_vlm(
 
     subtask_status = []
 
-    client = TiptopWebsocketClient(remote_host=remote_host, remote_port=remote_port)
+    client = TiptopWebsocketClient(
+        remote_host=remote_host,
+        remote_port=remote_port,
+        gripper_action_steps=tiptop_gripper_steps,
+        waypoint_stride=tiptop_waypoint_stride,
+    )
 
     if env.recorder_manager is not None and hasattr(env.recorder_manager, "set_hdf5_file"):
         env.recorder_manager.set_hdf5_file(f"run_{episode}.hdf5")

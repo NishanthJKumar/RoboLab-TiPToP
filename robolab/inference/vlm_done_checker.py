@@ -303,3 +303,70 @@ def get_next_subtask(goal: str, scene_frame: np.ndarray, memory: str) -> NextSub
         subtask=parsed.get("subtask"),
         done=bool(parsed.get("done", False)),
     )
+
+
+RECOVERY_PICK_PLACE_PROMPT = """A symbolic task planner has either failed to find a plan or just executed a Pick/Place step that did not succeed. You will now hand control to a Vision-Language-Action (VLA) policy that can execute ONE pick-and-place command. Your job is to pick the single most useful pick+place that gets the scene closer to the overall goal.
+
+## Overall goal
+{goal}
+{failed_context}{memory}
+## Rules
+- Output EXACTLY ONE command for the robot that includes BOTH a pick AND a place — e.g. "pick up the red cube and place it on the blue plate", "pick up the banana and put it back on the table". Never output a pick alone or a place alone.
+- Use distinguishing object attributes that are clearly visible in the image (color, shape, label, relative position). Avoid pronouns or vague references.
+- Choose the move that, after it is executed, will leave the scene in a state where the planner is most likely to succeed when called again — typically: undo a recent failure, clear an obstruction, or make direct progress on the goal.
+- Do NOT use motor primitives (e.g. "open gripper", "move arm up"). The VLA expects a high-level pick+place.
+- If the overall goal is already fully satisfied in the current image, set "done": true and "instruction": null.
+
+Respond with JSON only, no markdown:
+{{"instruction": "<single pick-and-place command, or null if done>", "done": true/false}}
+"""
+
+
+@dataclass
+class RecoveryResult:
+    instruction: str | None
+    done: bool
+
+
+def get_recovery_pick_place(
+    goal: str,
+    scene_frame: np.ndarray,
+    failed_subtask: str | None = None,
+    memory: str = "",
+) -> RecoveryResult:
+    """Ask the VLM for ONE combined pick+place command for the VLA to execute as recovery.
+
+    Used by the TipTop+VLA+VLM hybrid runner whenever the planner either can't produce
+    a plan from the current state or just executed a Pick/Place that the VLM judged
+    failed. The returned instruction is fed straight to the VLA as its language goal.
+    """
+    client = genai.Client(api_key=_get_api_key())
+    failed_context = (
+        f"\n## Failed planner subtask\nThe planner most recently attempted: \"{failed_subtask}\". "
+        "The VLM judged this Pick/Place to have failed. Plan your recovery accordingly.\n"
+        if failed_subtask
+        else "\n## Failed planner subtask\n(none — the planner could not find a plan from the current state)\n"
+    )
+    memory_block = f"\n## Memory\n{memory}\n" if memory else ""
+    prompt = RECOVERY_PICK_PLACE_PROMPT.format(
+        goal=goal, failed_context=failed_context, memory=memory_block
+    )
+
+    image_part = types.Part.from_bytes(
+        data=_image_to_bytes(scene_frame), mime_type="image/jpeg"
+    )
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=[image_part, prompt],
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+
+    text = _strip_fence(response.text or "")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return RecoveryResult(instruction=None, done=False)
+    return RecoveryResult(
+        instruction=parsed.get("instruction"),
+        done=bool(parsed.get("done", False)),
+    )
