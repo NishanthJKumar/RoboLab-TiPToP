@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 
 import cv2
@@ -182,12 +183,51 @@ def run_episode_vla_vlm(
             hlog(f"Subtask {subtask_index + 1}: \"{current_subtask}\"")
 
     actual_steps = 0
-    interrupted = False
+
+    # Isaac Sim / kit installs its own SIGINT handler that swallows the default
+    # Ctrl-C → KeyboardInterrupt path, so the episode runner never exits and the
+    # finally block (video release, JSON dump) never fires. Install our own
+    # handler that sets a flag the main loop checks, and restore the previous
+    # handler in finally. Second Ctrl-C escalates to raising KeyboardInterrupt
+    # so the user can still force-kill if cleanup itself hangs.
+    interrupted = {"count": 0}
+    prev_sigint_handler = signal.getsignal(signal.SIGINT)
+
+    def _on_sigint(signum, frame):
+        interrupted["count"] += 1
+        if interrupted["count"] == 1:
+            print(
+                "\n\033[93m[Harness] Ctrl-C received — finishing current step then "
+                "shutting down cleanly (videos + logs). Press Ctrl-C again to force.\033[0m",
+                flush=True,
+            )
+        else:
+            print(
+                "\n\033[91m[Harness] Second Ctrl-C — raising KeyboardInterrupt (may skip cleanup).\033[0m",
+                flush=True,
+            )
+            raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        # Non-main thread or platform restriction — signal install isn't critical,
+        # the launcher's KeyboardInterrupt fallback still works.
+        prev_sigint_handler = None
+
     try:
         for step in tqdm(range(max_steps)):
 
+            if interrupted["count"] > 0:
+                hlog("Loop exit triggered by SIGINT.", color="\033[93m")
+                break
+
             while not timeline.is_playing():
                 kit_app.update()
+                if interrupted["count"] > 0:
+                    break
+            if interrupted["count"] > 0:
+                break
 
             timer.start("policy_inference")
             actions = torch.zeros(env.num_envs, action_dim, device=env.device)
@@ -402,12 +442,21 @@ def run_episode_vla_vlm(
                 dbg(f"STATE @ step {step}: all envs terminated -> ending episode")
                 break
     except KeyboardInterrupt:
-        interrupted = True
+        # Reached via the second Ctrl-C (escalation in _on_sigint) or if the
+        # interrupt lands outside the per-step flag checks above.
+        interrupted["count"] += 1
         dbg(f"INTERRUPTED @ step {actual_steps}: Ctrl-C received -> "
             f"finalizing videos and shutting down gracefully")
         hlog("Interrupted by user (Ctrl-C); flushing videos before exit.",
              color="\033[91m")
     finally:
+        # Restore whatever SIGINT handler was in place before this episode.
+        if prev_sigint_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, prev_sigint_handler)
+            except (ValueError, OSError):
+                pass
+
         # Finalize videos FIRST so even a partial/interrupted run leaves playable
         # mp4s (release() flushes buffered frames + writes the mp4 trailer). Each
         # release is guarded so one bad writer can't block the others or the rest
@@ -425,7 +474,7 @@ def run_episode_vla_vlm(
             subtask_log.append({
                 "index": subtask_index + 1,
                 "subtask": current_subtask,
-                "status": "interrupted" if interrupted else "abandoned",
+                "status": "interrupted" if interrupted["count"] > 0 else "abandoned",
                 "steps_taken": actual_steps - subtask_start_step,
             })
 
@@ -435,7 +484,7 @@ def run_episode_vla_vlm(
                     json.dump({
                         "goal": instruction,
                         "goal_achieved": goal_achieved,
-                        "interrupted": interrupted,
+                        "interrupted": interrupted["count"] > 0,
                         "subtasks": subtask_log,
                     }, f, indent=2)
             else:
@@ -443,7 +492,7 @@ def run_episode_vla_vlm(
                     json.dump({
                         "goal": instruction,
                         "goal_achieved": goal_achieved,
-                        "interrupted": interrupted,
+                        "interrupted": interrupted["count"] > 0,
                         "subtasks": {1: instruction},
                     }, f, indent=2)
         except Exception:
@@ -454,7 +503,7 @@ def run_episode_vla_vlm(
 
     client.reset()
 
-    if interrupted:
+    if interrupted["count"] > 0:
         # Videos/logs are already flushed in the finally above; re-raise so the
         # caller (and Isaac) tear down the sim and the run actually stops.
         raise KeyboardInterrupt
