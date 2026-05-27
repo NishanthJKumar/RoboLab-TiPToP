@@ -90,11 +90,15 @@ def _truncate(text: str | None, max_len: int = 60) -> str:
     return text[: max_len - 1] + "…"
 
 
-def _annotate(frame: np.ndarray, mode: str, subtask: str | None, step: int, is_transition: bool) -> np.ndarray:
-    """Draw a 3-line mode banner on a video frame. RGB in, RGB out."""
+def _annotate(frame: np.ndarray, mode: str, subtask: str | None, step: int, is_transition: bool,
+              subtask2: str | None = None) -> np.ndarray:
+    """Draw a mode banner on a video frame. RGB in, RGB out.
+
+    `subtask2` adds an optional extra line below `subtask` — used in subtask-driven mode
+    to show TipTop's internal Pick/Place label beneath the VLM subtask it's planning."""
     if is_transition:
         bg = _BANNER_BG_TRANSITION
-        lines = [f"MODE → {mode}", _truncate(subtask), f"step {step} (switched)"]
+        head, tail = f"MODE → {mode}", f"step {step} (switched)"
     else:
         if mode == MODE_TIPTOP:
             bg = _BANNER_BG_TIPTOP
@@ -102,7 +106,11 @@ def _annotate(frame: np.ndarray, mode: str, subtask: str | None, step: int, is_t
             bg = _BANNER_BG_HOMING
         else:
             bg = _BANNER_BG_VLA
-        lines = [f"MODE: {mode}", _truncate(subtask), f"step {step}"]
+        head, tail = f"MODE: {mode}", f"step {step}"
+    lines = [head, _truncate(subtask)]
+    if subtask2 is not None:
+        lines.append(_truncate(subtask2))
+    lines.append(tail)
     return add_multiline_text_overlay_with_background(
         frame,
         lines,
@@ -136,6 +144,7 @@ def run_episode_tiptop_vla_vlm(
     tiptop_gripper_steps: int = 20,
     tiptop_waypoint_stride: int | None = None,
     home_pose_steps: int = 30,
+    subtask_driven_replan: bool = False,
 ):
     """Hybrid TipTop+VLA+VLM episode. See module docstring for the state machine."""
     if env.num_envs != 1:
@@ -273,6 +282,14 @@ def run_episode_tiptop_vla_vlm(
     vla_subtask_start_step: int = 0
     failed_label_context: str | None = None
 
+    # Subtask-driven replanning state (only used when subtask_driven_replan=True).
+    # Once the first VLA recovery fires we enter "subtask mode": TipTop is fed one
+    # VLM-generated pick+place subtask at a time (via `active_subtask`) instead of the
+    # full instruction, and we keep advancing subtasks until the goal is done.
+    active_subtask: str | None = None
+    entered_subtask_mode: bool = False
+    completed_subtasks: list[str] = []
+
     # TipTop boundary-check state (mirrors episode_tiptop_vlm.py)
     pending_checks: list[dict] = []
     event_counter: int = 0
@@ -324,7 +341,8 @@ def run_episode_tiptop_vla_vlm(
         f"VLA-recovery timeout: {subtask_timeout_steps} steps  |  "
         f"home-pose steps before TipTop replan: {home_pose_steps}"
     )
-    dbg(f"START | mode=TIPTOP (tentative) | vlm_check_delay_steps={vlm_check_delay_steps} | "
+    dbg(f"START | mode=TIPTOP (tentative) | subtask_driven_replan={subtask_driven_replan} | "
+        f"vlm_check_delay_steps={vlm_check_delay_steps} | "
         f"vla_check_every_n_steps={check_every_n_steps} | vla_timeout_steps={subtask_timeout_steps} | "
         f"home_pose_steps={home_pose_steps}")
 
@@ -358,47 +376,69 @@ def run_episode_tiptop_vla_vlm(
                     pass
         vla_client = _make_vla_client()
 
-    def _request_vla_recovery(step: int, reason: str) -> bool:
-        """Pick a fresh recovery subtask via the VLM and prep the VLA client.
-        Returns True if a subtask was acquired, False if the VLM declared the goal done."""
-        nonlocal vla_subtask, vla_subtask_start_step, goal_achieved
+    def _tiptop_goal() -> str:
+        """Language goal handed to TipTop at plan time. In subtask-driven mode (after the
+        first VLA recovery) this is the current VLM-generated subtask; otherwise it's the
+        full task instruction (the default, unchanged behavior)."""
+        if subtask_driven_replan and entered_subtask_mode and active_subtask is not None:
+            return active_subtask
+        return instruction
+
+    def _pick_next_subtask(step: int, reason: str) -> bool:
+        """Ask the VLM (`get_recovery_pick_place`) for the next single pick+place subtask
+        and store it in `active_subtask`. Returns True if a subtask was acquired, False if
+        the VLM declared the overall goal already done (sets `goal_achieved`).
+
+        Shared by VLA recovery and (in subtask-driven mode) TipTop subtask advancement, so
+        there is one source of subtask generation."""
+        nonlocal active_subtask, goal_achieved
         scene_frame = _build_vlm_view(obs, env_id=0)
         monitor.set_frame(scene_frame)
         _save_debug_image(scene_frame, f"recovery_request_step{step:04d}.png")
+        memory = "\n".join(f"- done: {s}" for s in completed_subtasks)
         timer.start("vlm_check")
         try:
             rec = get_recovery_pick_place(
-                instruction, scene_frame, failed_subtask=failed_label_context
+                instruction, scene_frame, failed_subtask=failed_label_context, memory=memory
             )
         except Exception as e:
             timer.stop("vlm_check")
             hlog(
                 f"get_recovery_pick_place failed at step {step}: {type(e).__name__}: {e}. "
-                "Falling back to the raw task instruction as VLA goal.",
+                "Falling back to the raw task instruction as subtask.",
                 color="\033[91m",
             )
-            vla_subtask = instruction
-            vla_subtask_start_step = step
-            _ensure_fresh_vla_client()
+            active_subtask = instruction
             return True
         timer.stop("vlm_check")
 
         if rec.done:
-            dbg(f"RECOVERY REQUEST @ step {step} ({reason}) | VLM recovery done=True -> "
-                f"GOAL ACHIEVED, no recovery needed")
+            dbg(f"SUBTASK PICK @ step {step} ({reason}) | VLM done=True -> GOAL ACHIEVED")
             hlog(
-                f"VLM declares the overall goal already achieved during recovery request "
+                f"VLM declares the overall goal already achieved during subtask request "
                 f"(step {step}, reason: {reason}).",
                 color="\033[92m",
             )
             goal_achieved = True
             return False
 
-        vla_subtask = rec.instruction or instruction
+        active_subtask = rec.instruction or instruction
+        dbg(f"SUBTASK PICK @ step {step} ({reason}) | VLM done=False -> "
+            f"active_subtask={active_subtask!r}")
+        return True
+
+    def _request_vla_recovery(step: int, reason: str) -> bool:
+        """Pick a fresh subtask via the VLM and prep the VLA client to execute it.
+        Returns True if a subtask was acquired, False if the VLM declared the goal done."""
+        nonlocal vla_subtask, vla_subtask_start_step, entered_subtask_mode
+        if not _pick_next_subtask(step, reason):
+            return False
+        # Entering subtask-driven mode: from now on TipTop is fed `active_subtask` (not the
+        # full instruction) on replan. No-op behaviorally unless subtask_driven_replan=True.
+        entered_subtask_mode = True
+        vla_subtask = active_subtask
         vla_subtask_start_step = step
         _ensure_fresh_vla_client()
-        dbg(f"RECOVERY REQUEST @ step {step} ({reason}) | VLM recovery done=False -> "
-            f"hand VLA the pick+place: {vla_subtask!r}")
         hlog(f"VLA recovery subtask: \"{vla_subtask}\"")
         return True
 
@@ -459,13 +499,14 @@ def run_episode_tiptop_vla_vlm(
                 # Try TipTop: reset + infer triggers a fresh _query_server. On success the
                 # returned action drives this step; on PlanningError we fall through to VLA.
                 pending_tiptop_replan = False
-                dbg(f"REPLAN @ step {step} | asking TipTop for a fresh plan from current state")
+                dbg(f"REPLAN @ step {step} | asking TipTop for a fresh plan toward "
+                    f"{_tiptop_goal()!r}")
                 try:
                     if tiptop_client._plan is not None:
                         tiptop_client.reset()
                     timer.stop("policy_inference")
                     timer.start("vlm_next_subtask")  # use this bucket for planning latency
-                    ret = tiptop_client.infer(obs, instruction, env_id=0)
+                    ret = tiptop_client.infer(obs, _tiptop_goal(), env_id=0)
                     timer.stop("vlm_next_subtask")
                     timer.start("policy_inference")
                     this_step_action = ret["action"]
@@ -535,7 +576,7 @@ def run_episode_tiptop_vla_vlm(
             # If we didn't acquire an action via the replan branch, drive normally.
             if this_step_action is None and not goal_achieved:
                 if mode == MODE_TIPTOP:
-                    ret = tiptop_client.infer(obs, instruction, env_id=0)
+                    ret = tiptop_client.infer(obs, _tiptop_goal(), env_id=0)
                     this_step_action = ret["action"]
                     last_viz = ret.get("viz")
                 else:  # MODE_VLA
@@ -625,21 +666,32 @@ def run_episode_tiptop_vla_vlm(
                 is_transition_frame = (
                     prev_executed_mode is not None and executed_mode != prev_executed_mode
                 )
+                # In subtask-driven mode, show the VLM subtask we're driving toward; in
+                # TIPTOP also show TipTop's internal Pick/Place label beneath it.
+                in_subtask_mode = subtask_driven_replan and entered_subtask_mode and active_subtask is not None
+                banner_subtask2 = None
                 if mode == MODE_TIPTOP:
-                    banner_subtask = tiptop_client.current_subtask_label or "(plan idle)"
+                    tiptop_label = tiptop_client.current_subtask_label or "(plan idle)"
+                    if in_subtask_mode:
+                        banner_subtask = f"goal: {active_subtask}"
+                        banner_subtask2 = f"tiptop: {tiptop_label}"
+                    else:
+                        banner_subtask = tiptop_label
                 elif mode == MODE_HOMING:
                     banner_subtask = f"home pose ({homing_steps_remaining} steps left)"
+                    if in_subtask_mode:
+                        banner_subtask2 = f"next: {active_subtask}"
                 else:
                     banner_subtask = vla_subtask or "(recovery pending)"
                 if save_sensor:
                     frame_obs = unpack_image_obs(obs, scale=0.5, env_id=0).get("combined_image")
                     if frame_obs is not None:
-                        frame_obs = _annotate(frame_obs, executed_mode, banner_subtask, step, is_transition_frame)
+                        frame_obs = _annotate(frame_obs, executed_mode, banner_subtask, step, is_transition_frame, banner_subtask2)
                         video_writers_obs[0].write(frame_obs)
                 if save_viewport:
                     frame_vp = unpack_viewport_cams(obs, env_id=0).get("combined_image")
                     if frame_vp is not None:
-                        frame_vp = _annotate(frame_vp, executed_mode, banner_subtask, step, is_transition_frame)
+                        frame_vp = _annotate(frame_vp, executed_mode, banner_subtask, step, is_transition_frame, banner_subtask2)
                         video_writers_viewport[0].write(frame_vp)
                 prev_executed_mode = executed_mode
                 timer.stop("video_write")
@@ -830,12 +882,20 @@ def run_episode_tiptop_vla_vlm(
                              color="\033[92m")
                         goal_achieved = True
                     else:
-                        hlog(
-                            "Overall goal NOT done after plan; homing arm before "
-                            "TipTop replan.",
-                            color="\033[93m",
-                        )
-                        pending_homing = True
+                        # Subtask-driven mode (once active): TipTop just finished a subtask
+                        # plan but the goal isn't done, so advance to the next VLM subtask and
+                        # replan toward it. Otherwise (default, or pre-VLA): replan full task.
+                        if subtask_driven_replan and entered_subtask_mode:
+                            if active_subtask is not None:
+                                completed_subtasks.append(active_subtask)
+                            _pick_next_subtask(step, reason="advance after tiptop subtask plan-done")
+                        if not goal_achieved:
+                            hlog(
+                                "Overall goal NOT done after plan; homing arm before "
+                                "TipTop replan.",
+                                color="\033[93m",
+                            )
+                            pending_homing = True
 
             # ---------------------------------------------------------------
             # VLA-recovery periodic completion check.
@@ -900,13 +960,22 @@ def run_episode_tiptop_vla_vlm(
                         timed_out = elapsed >= subtask_timeout_steps
                         if completed or timed_out:
                             reason = "completed" if completed else f"timeout ({elapsed} steps)"
-                            dbg(f"DECISION @ step {step} | VLA recovery ended ({reason}) -> "
-                                f"HOME then TipTop replan")
-                            hlog(
-                                f"VLA recovery subtask ended ({reason}); "
-                                "homing arm before TipTop replan.",
-                            )
-                            pending_homing = True
+                            if completed and vla_subtask is not None:
+                                completed_subtasks.append(vla_subtask)
+                            # Subtask-driven mode: pick the NEXT subtask now so the post-homing
+                            # replan plans toward it instead of the full instruction. If the VLM
+                            # says the goal is done, goal_achieved is set and we skip homing.
+                            if subtask_driven_replan:
+                                _pick_next_subtask(step, reason=f"advance after VLA recovery ({reason})")
+                                failed_label_context = None  # fresh scene for TipTop replan
+                            if not goal_achieved:
+                                dbg(f"DECISION @ step {step} | VLA recovery ended ({reason}) -> "
+                                    f"HOME then TipTop replan toward {_tiptop_goal()!r}")
+                                hlog(
+                                    f"VLA recovery subtask ended ({reason}); "
+                                    "homing arm before TipTop replan.",
+                                )
+                                pending_homing = True
                         else:
                             dbg(f"DECISION @ step {step} | VLA recovery not done, no timeout -> "
                                 f"CONTINUE executing {vla_subtask!r}")

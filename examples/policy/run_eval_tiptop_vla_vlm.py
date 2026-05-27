@@ -116,6 +116,11 @@ parser.add_argument("--home-pose-steps", "--home_pose_steps", type=int, default=
                          "to skip homing.")
 parser.add_argument("--episode-length-s", "--episode_length_s", type=float, default=None,
                     help="Override env_cfg.episode_length_s (in seconds) before each episode.")
+parser.add_argument("--subtask-driven-replan", "--subtask_driven_replan", action="store_true",
+                    help="After the first VLA recovery, feed TipTop one VLM-generated pick+place "
+                         "subtask at a time (instead of the full instruction) and keep advancing "
+                         "subtasks for both TipTop and the VLA until the goal is done. Default "
+                         "(off) replans TipTop with the full instruction after each recovery.")
 
 args_cli, _= parser.parse_known_args()
 args_cli.enable_cameras = True
@@ -324,6 +329,7 @@ def main():
                 tiptop_gripper_steps=args_cli.tiptop_gripper_steps,
                 tiptop_waypoint_stride=args_cli.tiptop_waypoint_stride,
                 home_pose_steps=args_cli.home_pose_steps,
+                subtask_driven_replan=args_cli.subtask_driven_replan,
             )
 
             final_infos = get_final_subtask_info(env, env_id=None)
