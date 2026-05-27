@@ -226,6 +226,11 @@ def run_episode_tiptop_vlm(
         print(f"{color}[Harness] {msg}\033[0m")
         logger.info(msg)
 
+    def dbg(msg):
+        """Compact state-machine trace: inputs evaluated -> decision -> next action."""
+        print(f"\033[95m[STATE] {msg}\033[0m", flush=True)
+        logger.info(f"[STATE] {msg}")
+
     monitor = ProgressMonitor(model_id=vlm_model)
 
     debug_dir: Path | None = None
@@ -267,6 +272,8 @@ def run_episode_tiptop_vlm(
     hlog(f"VLM check delay after gripper transition: {vlm_check_delay_steps} steps")
     if debug_dir is not None:
         hlog(f"Saving VLM debug images to {debug_dir}")
+    dbg(f"START | mode=tiptop (planner-driven, VLM passive auditor) | "
+        f"vlm_check_delay_steps={vlm_check_delay_steps}")
 
     actual_steps = 0
     try:
@@ -322,6 +329,9 @@ def run_episode_tiptop_vlm(
                         "event_index": event_counter,
                         "transition_image": transition_path,
                     })
+                    dbg(f"BOUNDARY @ step {step} | label {prev_label!r} -> {curr_label!r} "
+                        f"(left supported {prev_kind} subtask) -> SCHEDULE {prev_kind} check "
+                        f"#{event_counter} to fire at step {fire_step} (=step+{vlm_check_delay_steps})")
                     hlog(
                         f"Subtask boundary at step {step}: left '{prev_label}' "
                         f"(now {curr_label!r}) → {prev_kind} check #{event_counter} "
@@ -386,6 +396,10 @@ def run_episode_tiptop_vlm(
                         check["label"] or "Place(...)", check.get("target"), instruction
                     )
 
+                dbg(f"FIRE CHECK @ step {step} | event #{check['event_index']} ({check['kind']}, "
+                    f"{check['label']!r}) scheduled at boundary step {check['event_step']} | "
+                    f"auditing whether that subtask succeeded")
+
                 timer.start("vlm_check")
                 try:
                     result = monitor.check_completion(
@@ -393,6 +407,8 @@ def run_episode_tiptop_vlm(
                     )
                 except Exception as e:
                     timer.stop("vlm_check")
+                    dbg(f"DECISION: event #{check['event_index']} VLM errored -> record completed=None, "
+                        f"slide before-frame forward, keep going")
                     hlog(
                         f"VLM check FAILED for event #{check['event_index']} "
                         f"({check['kind']}, {check['label']}): {type(e).__name__}: {e}",
@@ -420,6 +436,9 @@ def run_episode_tiptop_vlm(
 
                 completed = bool(result["completed"])
                 color = "\033[92m" if completed else "\033[93m"
+                dbg(f"RESULT @ step {step} | event #{check['event_index']} ({check['kind']}) "
+                    f"completed={completed} | reason={result.get('reason', '')!r} -> "
+                    f"record verdict + slide before-frame forward (planner keeps driving)")
                 hlog(
                     f"VLM event #{check['event_index']} ({check['kind']}, "
                     f"{check['label']}) @ boundary={check['event_step']}, "
@@ -459,10 +478,14 @@ def run_episode_tiptop_vlm(
             plan_done = bool(getattr(client, "plan_done", False))
             if plan_done and not plan_done_logged:
                 if pending_checks:
+                    dbg(f"STATE @ step {step}: planner plan_done=True but {len(pending_checks)} "
+                        f"check(s) still pending -> KEEP STEPPING to drain them before freezing")
                     hlog(
                         f"Plan completed at step {step}. Draining "
                         f"{len(pending_checks)} pending VLM check(s) before freezing."
                     )
+                else:
+                    dbg(f"STATE @ step {step}: planner plan_done=True, no pending checks -> ready to freeze")
                 plan_done_logged = True
 
             if (
@@ -470,6 +493,8 @@ def run_episode_tiptop_vlm(
                 and not pending_checks
                 and 0 in env.active_env_ids
             ):
+                dbg(f"STATE @ step {step}: plan_done and all checks drained -> freezing env 0 "
+                    f"(result={bool(env.termination_manager.terminated[0])})")
                 env._frozen_envs[0] = True
                 env._env_results[0] = bool(env.termination_manager.terminated[0])
                 env._env_term_step[0] = int(env.episode_length_buf[0].item())
@@ -480,10 +505,13 @@ def run_episode_tiptop_vlm(
                         logger.exception("Failed to export recorder for env 0")
 
             if env.all_terminated:
+                dbg(f"STATE @ step {step}: all envs terminated -> ending episode")
                 break
     finally:
         # Record any pending checks that didn't fire (episode ended too early).
         if pending_checks:
+            dbg(f"END: episode ended with {len(pending_checks)} scheduled check(s) UNFIRED "
+                f"-> recording them as completed=None")
             hlog(
                 f"Episode ended with {len(pending_checks)} VLM check(s) unfired.",
                 color="\033[93m",

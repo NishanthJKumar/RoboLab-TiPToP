@@ -136,6 +136,11 @@ def run_episode_vla_vlm(
         print(f"{color}[Harness] {msg}\033[0m")
         logger.info(msg)
 
+    def dbg(msg):
+        """Compact state-machine trace: inputs evaluated -> decision -> next action."""
+        print(f"\033[95m[STATE] {msg}\033[0m", flush=True)
+        logger.info(f"[STATE] {msg}")
+
     initial_frame = unpack_image_obs(obs, scale=0.5, env_id=0).get("combined_image")
     monitor = ProgressMonitor(check_every_n_steps=check_every_n_steps, model_id=vlm_model)
 
@@ -148,6 +153,10 @@ def run_episode_vla_vlm(
     goal_achieved = False
 
     hlog(f"Instruction: \"{instruction}\"")
+    hlog(f"Output dir: {harness_dir}")
+    dbg(f"START | mode={'dynamic' if dynamic_prompting else 'plain'} | "
+        f"check_every_n_steps={check_every_n_steps}"
+        + (f" | subtask_timeout_steps={subtask_timeout_steps}" if dynamic_prompting else ""))
 
     if dynamic_prompting:
         memory = MemoryManager(harness_dir / f"memory_{episode}.md", model_id=vlm_model)
@@ -164,13 +173,16 @@ def run_episode_vla_vlm(
             plan_result = NextSubtaskResult(subtask=instruction, done=False)
         timer.stop("vlm_next_subtask")
         if plan_result.done:
+            dbg(f"INITIAL PLAN | planner done=True -> GOAL already achieved, no execution needed")
             hlog(f"VLM says goal is already achieved: \"{instruction}\"")
             goal_achieved = True
         else:
             current_subtask = plan_result.subtask or instruction
+            dbg(f"INITIAL PLAN | planner done=False -> start subtask {subtask_index + 1}: {current_subtask!r}")
             hlog(f"Subtask {subtask_index + 1}: \"{current_subtask}\"")
 
     actual_steps = 0
+    interrupted = False
     try:
         for step in tqdm(range(max_steps)):
 
@@ -228,6 +240,13 @@ def run_episode_vla_vlm(
                 frame = unpack_image_obs(obs, scale=0.5, env_id=0).get("combined_image")
                 monitor.set_frame(frame)
 
+                if dynamic_prompting:
+                    dbg(f"CHECK @ step {step} | evaluating subtask {subtask_index + 1}: "
+                        f"{current_subtask!r} | before_frame=last subtask boundary")
+                else:
+                    dbg(f"CHECK @ step {step} | evaluating goal: {instruction!r} | "
+                        f"before_frame=previous check")
+
                 timer.start("vlm_check")
                 try:
                     if dynamic_prompting:
@@ -241,6 +260,7 @@ def run_episode_vla_vlm(
                         )
                 except Exception as e:
                     timer.stop("vlm_check")
+                    dbg(f"DECISION: VLM check errored -> skip this tick, keep executing current target")
                     hlog(f"VLM check failed (skipping): {type(e).__name__}: {e}", color="\033[91m")
                     prev_frame = frame
                     continue
@@ -254,9 +274,15 @@ def run_episode_vla_vlm(
                     )
 
                 subtask_elapsed = step - subtask_start_step
+                dbg(f"RESULT @ step {step} | completed={result['completed']} | "
+                    f"elapsed={subtask_elapsed}"
+                    + (f"/{subtask_timeout_steps} (timeout {'HIT' if subtask_elapsed >= subtask_timeout_steps else 'not hit'})" if dynamic_prompting else "")
+                    + f" | reason={result.get('reason', '')!r}")
 
                 if result["completed"]:
                     if dynamic_prompting:
+                        dbg(f"DECISION: completed=True -> subtask {subtask_index + 1} SUCCEEDED; "
+                            f"record to memory + ask planner for next subtask")
                         hlog(
                             f"Subtask succeeded: {subtask_index + 1} \"{current_subtask}\" | {result['reason']}",
                             color="\033[92m",
@@ -283,14 +309,18 @@ def run_episode_vla_vlm(
                         timer.stop("vlm_next_subtask")
 
                         if plan_result.done:
+                            dbg(f"DECISION: planner done=True -> GOAL ACHIEVED, will freeze env 0")
                             hlog(f"Goal achieved: \"{instruction}\"", color="\033[92m")
                             goal_achieved = True
                         else:
                             subtask_index += 1
                             current_subtask = plan_result.subtask or instruction
                             subtask_start_step = step
+                            dbg(f"DECISION: planner done=False -> ADVANCE to subtask {subtask_index + 1}: "
+                                f"{current_subtask!r} (timer reset at step {step})")
                             hlog(f"Subtask {subtask_index + 1}: \"{current_subtask}\"")
                     else:
+                        dbg(f"DECISION: completed=True (plain mode) -> GOAL ACHIEVED, will freeze env 0")
                         hlog(
                             f"Goal achieved: \"{instruction}\" | {result['reason']}",
                             color="\033[92m",
@@ -298,6 +328,9 @@ def run_episode_vla_vlm(
                         goal_achieved = True
 
                 elif dynamic_prompting and subtask_elapsed >= subtask_timeout_steps:
+                    dbg(f"DECISION: completed=False AND elapsed {subtask_elapsed} >= timeout "
+                        f"{subtask_timeout_steps} -> subtask {subtask_index + 1} TIMED OUT; "
+                        f"record to memory + reprompt planner")
                     hlog(
                         f"Subtask timed out: {subtask_index + 1} \"{current_subtask}\" after {subtask_elapsed} steps",
                         color="\033[91m",
@@ -324,21 +357,27 @@ def run_episode_vla_vlm(
                     timer.stop("vlm_next_subtask")
 
                     if plan_result.done:
+                        dbg(f"DECISION: planner done=True after timeout reprompt -> GOAL ACHIEVED, will freeze env 0")
                         hlog(f"Goal achieved after timeout reprompt: \"{instruction}\"", color="\033[92m")
                         goal_achieved = True
                     else:
                         subtask_index += 1
                         current_subtask = plan_result.subtask or instruction
                         subtask_start_step = step
+                        dbg(f"DECISION: planner done=False after timeout -> SWITCH to subtask {subtask_index + 1}: "
+                            f"{current_subtask!r} (timer reset at step {step})")
                         hlog(f"Subtask {subtask_index + 1} (reprompted): \"{current_subtask}\"")
                 else:
                     if dynamic_prompting:
+                        dbg(f"DECISION: completed=False, elapsed {subtask_elapsed} < timeout "
+                            f"{subtask_timeout_steps} -> CONTINUE executing subtask {subtask_index + 1}")
                         hlog(
                             f"Subtask not done: {subtask_index + 1} \"{current_subtask}\" | "
                             f"{result['reason']} ({subtask_elapsed}/{subtask_timeout_steps} steps)",
                             color="\033[93m",
                         )
                     else:
+                        dbg(f"DECISION: completed=False (plain mode) -> CONTINUE executing toward goal")
                         hlog(
                             f"Goal not done: \"{instruction}\" | {result['reason']}",
                             color="\033[93m",
@@ -348,6 +387,8 @@ def run_episode_vla_vlm(
 
             # --- VLM-signalled termination: freeze env 0 only (harness runs there). ---
             if goal_achieved and not env._frozen_envs[0]:
+                dbg(f"STATE @ step {step}: goal_achieved -> freezing env 0 as SUCCESS "
+                    f"(term_step={int(env.episode_length_buf[0].item())})")
                 env._frozen_envs[0] = True
                 env._env_results[0] = True
                 env._env_term_step[0] = int(env.episode_length_buf[0].item())
@@ -358,13 +399,33 @@ def run_episode_vla_vlm(
                         logger.exception("Failed to export recorder for env 0")
 
             if env.all_terminated:
+                dbg(f"STATE @ step {step}: all envs terminated -> ending episode")
                 break
+    except KeyboardInterrupt:
+        interrupted = True
+        dbg(f"INTERRUPTED @ step {actual_steps}: Ctrl-C received -> "
+            f"finalizing videos and shutting down gracefully")
+        hlog("Interrupted by user (Ctrl-C); flushing videos before exit.",
+             color="\033[91m")
     finally:
+        # Finalize videos FIRST so even a partial/interrupted run leaves playable
+        # mp4s (release() flushes buffered frames + writes the mp4 trailer). Each
+        # release is guarded so one bad writer can't block the others or the rest
+        # of cleanup below.
+        if save_videos:
+            for vw in video_writers_obs + video_writers_viewport:
+                try:
+                    vw.release()
+                except Exception:
+                    logger.exception("Failed to release a video writer")
+
         if dynamic_prompting and not goal_achieved:
+            dbg(f"END: episode ended WITHOUT goal achieved -> subtask {subtask_index + 1} "
+                f"{current_subtask!r} marked abandoned ({actual_steps - subtask_start_step} steps in)")
             subtask_log.append({
                 "index": subtask_index + 1,
                 "subtask": current_subtask,
-                "status": "abandoned",
+                "status": "interrupted" if interrupted else "abandoned",
                 "steps_taken": actual_steps - subtask_start_step,
             })
 
@@ -374,6 +435,7 @@ def run_episode_vla_vlm(
                     json.dump({
                         "goal": instruction,
                         "goal_achieved": goal_achieved,
+                        "interrupted": interrupted,
                         "subtasks": subtask_log,
                     }, f, indent=2)
             else:
@@ -381,6 +443,7 @@ def run_episode_vla_vlm(
                     json.dump({
                         "goal": instruction,
                         "goal_achieved": goal_achieved,
+                        "interrupted": interrupted,
                         "subtasks": {1: instruction},
                     }, f, indent=2)
         except Exception:
@@ -389,11 +452,12 @@ def run_episode_vla_vlm(
         logger.removeHandler(file_handler)
         file_handler.close()
 
-    if save_videos:
-        for vw in video_writers_obs + video_writers_viewport:
-            vw.release()
-
     client.reset()
+
+    if interrupted:
+        # Videos/logs are already flushed in the finally above; re-raise so the
+        # caller (and Isaac) tear down the sim and the run actually stops.
+        raise KeyboardInterrupt
 
     timing = timer.to_dict(actual_steps)
     return env.get_env_results(), subtask_status, timing

@@ -229,6 +229,11 @@ def run_episode_tiptop_vla_vlm(
         print(f"{color}[Harness] {msg}\033[0m")
         logger.info(msg)
 
+    def dbg(msg):
+        """Compact state-machine trace: inputs evaluated -> decision -> next action."""
+        print(f"\033[95m[STATE] {msg}\033[0m", flush=True)
+        logger.info(f"[STATE] {msg}")
+
     monitor = ProgressMonitor(model_id=vlm_model)
 
     debug_dir: Path | None = None
@@ -319,6 +324,9 @@ def run_episode_tiptop_vla_vlm(
         f"VLA-recovery timeout: {subtask_timeout_steps} steps  |  "
         f"home-pose steps before TipTop replan: {home_pose_steps}"
     )
+    dbg(f"START | mode=TIPTOP (tentative) | vlm_check_delay_steps={vlm_check_delay_steps} | "
+        f"vla_check_every_n_steps={check_every_n_steps} | vla_timeout_steps={subtask_timeout_steps} | "
+        f"home_pose_steps={home_pose_steps}")
 
     def _record_transition(step: int, from_mode: str | None, to_mode: str, reason: str,
                            subtask_before: str | None, subtask_after: str | None):
@@ -330,6 +338,8 @@ def run_episode_tiptop_vla_vlm(
             "subtask_before": subtask_before,
             "subtask_after": subtask_after,
         })
+        dbg(f"MODE TRANSITION @ step {step}: {from_mode} -> {to_mode} | reason={reason} | "
+            f"subtask {subtask_before!r} -> {subtask_after!r}")
         hlog(
             f"MODE TRANSITION @ step {step}: {from_mode} → {to_mode} | {reason}",
             color="\033[95m",
@@ -374,6 +384,8 @@ def run_episode_tiptop_vla_vlm(
         timer.stop("vlm_check")
 
         if rec.done:
+            dbg(f"RECOVERY REQUEST @ step {step} ({reason}) | VLM recovery done=True -> "
+                f"GOAL ACHIEVED, no recovery needed")
             hlog(
                 f"VLM declares the overall goal already achieved during recovery request "
                 f"(step {step}, reason: {reason}).",
@@ -385,6 +397,8 @@ def run_episode_tiptop_vla_vlm(
         vla_subtask = rec.instruction or instruction
         vla_subtask_start_step = step
         _ensure_fresh_vla_client()
+        dbg(f"RECOVERY REQUEST @ step {step} ({reason}) | VLM recovery done=False -> "
+            f"hand VLA the pick+place: {vla_subtask!r}")
         hlog(f"VLA recovery subtask: \"{vla_subtask}\"")
         return True
 
@@ -436,6 +450,7 @@ def run_episode_tiptop_vla_vlm(
                 if homing_steps_remaining == 0:
                     # Hand off to the TipTop replan branch on the NEXT iteration.
                     pending_tiptop_replan = True
+                    dbg(f"HOMING done @ step {step} -> queue TipTop replan for next step")
                     hlog(
                         f"Homing complete at step {step}. Queuing TipTop replan for next step."
                     )
@@ -444,6 +459,7 @@ def run_episode_tiptop_vla_vlm(
                 # Try TipTop: reset + infer triggers a fresh _query_server. On success the
                 # returned action drives this step; on PlanningError we fall through to VLA.
                 pending_tiptop_replan = False
+                dbg(f"REPLAN @ step {step} | asking TipTop for a fresh plan from current state")
                 try:
                     if tiptop_client._plan is not None:
                         tiptop_client.reset()
@@ -497,6 +513,9 @@ def run_episode_tiptop_vla_vlm(
                         "completed": bool(done_chk.get("completed", False)),
                         "reason": done_chk.get("reason", ""),
                     })
+                    dbg(f"REPLAN FAILED @ step {step} (PlanningError) | overall-goal check "
+                        f"completed={bool(done_chk.get('completed', False))} -> "
+                        + ("END episode" if done_chk.get("completed") else "request VLA recovery"))
                     if done_chk.get("completed"):
                         hlog(f"Overall goal already achieved at step {step}; ending episode.",
                              color="\033[92m")
@@ -563,6 +582,9 @@ def run_episode_tiptop_vla_vlm(
                         "event_index": event_counter,
                         "transition_image": transition_path,
                     })
+                    dbg(f"BOUNDARY @ step {step} (TIPTOP) | label {prev_label!r} -> {curr_label!r} "
+                        f"(left {prev_kind} subtask) -> SCHEDULE {prev_kind} check #{event_counter} "
+                        f"to fire at step {fire_step}")
                     hlog(
                         f"TipTop subtask boundary at step {step}: left '{prev_label}' "
                         f"(now {curr_label!r}) → {prev_kind} check #{event_counter} "
@@ -627,6 +649,8 @@ def run_episode_tiptop_vla_vlm(
             if goal_achieved:
                 # Freeze env 0 once and break.
                 if 0 in env.active_env_ids:
+                    dbg(f"STATE @ step {step}: goal_achieved -> freezing env 0 as SUCCESS "
+                        f"(term_step={int(env.episode_length_buf[0].item())})")
                     env._frozen_envs[0] = True
                     env._env_results[0] = True
                     env._env_term_step[0] = int(env.episode_length_buf[0].item())
@@ -716,6 +740,10 @@ def run_episode_tiptop_vla_vlm(
 
                 completed = bool(result["completed"])
                 color = "\033[92m" if completed else "\033[93m"
+                dbg(f"RESULT @ step {step} (TIPTOP boundary) | event #{check['event_index']} "
+                    f"({check['kind']}) completed={completed} -> "
+                    + ("subtask OK, STAY in TIPTOP" if completed
+                       else "subtask FAILED, SWITCH to VLA recovery"))
                 hlog(
                     f"TipTop boundary VLM event #{check['event_index']} ({check['kind']}, "
                     f"{check['label']}) checked={step}: completed={completed} | "
@@ -793,6 +821,10 @@ def run_episode_tiptop_vla_vlm(
                         "reason": done_chk.get("reason", ""),
                     })
                     before_frame_vlm = scene_frame
+                    dbg(f"PLAN DONE @ step {step} | overall-goal check "
+                        f"completed={bool(done_chk.get('completed', False))} -> "
+                        + ("GOAL ACHIEVED, end episode" if done_chk.get("completed")
+                           else "not done, HOME then TipTop replan"))
                     if done_chk.get("completed"):
                         hlog(f"Overall goal achieved after plan: {done_chk.get('reason', '')}",
                              color="\033[92m")
@@ -844,6 +876,8 @@ def run_episode_tiptop_vla_vlm(
                     if result is not None:
                         completed = bool(result.get("completed", False))
                         color = "\033[92m" if completed else "\033[93m"
+                        dbg(f"VLA CHECK @ step {step} | elapsed={elapsed}/{subtask_timeout_steps} | "
+                            f"completed={completed} (timeout {'HIT' if elapsed >= subtask_timeout_steps else 'not hit'})")
                         hlog(
                             f"VLA recovery check at step {step} (elapsed {elapsed}): "
                             f"completed={completed} | {result.get('reason', '')}",
@@ -866,11 +900,16 @@ def run_episode_tiptop_vla_vlm(
                         timed_out = elapsed >= subtask_timeout_steps
                         if completed or timed_out:
                             reason = "completed" if completed else f"timeout ({elapsed} steps)"
+                            dbg(f"DECISION @ step {step} | VLA recovery ended ({reason}) -> "
+                                f"HOME then TipTop replan")
                             hlog(
                                 f"VLA recovery subtask ended ({reason}); "
                                 "homing arm before TipTop replan.",
                             )
                             pending_homing = True
+                        else:
+                            dbg(f"DECISION @ step {step} | VLA recovery not done, no timeout -> "
+                                f"CONTINUE executing {vla_subtask!r}")
                             # Clear failed_label_context — the VLM saw the recovery move;
                             # the next replan should plan from the fresh scene.
                             failed_label_context = None

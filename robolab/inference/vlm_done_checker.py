@@ -23,12 +23,15 @@ import io
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from google import genai
 from google.genai import types
 from PIL import Image
+
+from robolab.constants import get_output_dir
 
 MODEL_ID = "gemini-robotics-er-1.6-preview"
 
@@ -121,6 +124,58 @@ def _strip_fence(text: str) -> str:
     return text
 
 
+def _debug_print_vlm(label: str, prompt: str, response_text: str) -> None:
+    """Print the prompt sent to and raw text returned from the VLM.
+
+    No-op unless the VLM_DEBUG environment variable is set (e.g. VLM_DEBUG=1),
+    so it can be toggled without editing code.
+    """
+    if not os.environ.get("VLM_DEBUG"):
+        return
+    print(f"\n\033[95m===== [VLM DEBUG] {label} — PROMPT =====\033[0m")
+    print(prompt)
+    print(f"\033[95m===== [VLM DEBUG] {label} — RESPONSE =====\033[0m")
+    print(response_text)
+    print("\033[95m" + "=" * 48 + "\033[0m\n", flush=True)
+
+
+def _dump_vlm_call(
+    label: str,
+    prompt: str,
+    response_text: str,
+    images: list[tuple[str, bytes]],
+) -> None:
+    """Save one VLM invocation (prompt, images, response) to its own subfolder.
+
+    No-op unless the VLM_DUMP environment variable is set (e.g. VLM_DUMP=1).
+    Writes to ``<output_dir>/vlm_calls/<timestamp>_<label>/`` so debug artifacts
+    are grouped with the run that produced them. ``images`` is a list of
+    (name, jpeg_bytes) pairs in the order they were sent to the model.
+    """
+    if not os.environ.get("VLM_DUMP"):
+        return
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        call_dir = Path(get_output_dir()) / "vlm_calls" / f"{ts}_{label}"
+        call_dir.mkdir(parents=True, exist_ok=True)
+
+        (call_dir / "prompt.txt").write_text(prompt)
+        (call_dir / "response.txt").write_text(response_text)
+        for i, (name, data) in enumerate(images):
+            (call_dir / f"{i}_{name}.jpg").write_bytes(data)
+
+        meta = {
+            "timestamp": ts,
+            "label": label,
+            "model": MODEL_ID,
+            "num_images": len(images),
+            "image_order": [name for name, _ in images],
+        }
+        (call_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    except Exception as e:  # never let debug logging break a run
+        print(f"\033[91m[VLM DUMP] Failed to dump '{label}': {type(e).__name__}: {e}\033[0m", flush=True)
+
+
 class ProgressMonitor:
     """Calls a VLM to check if the current subtask is done."""
 
@@ -145,17 +200,18 @@ class ProgressMonitor:
     ) -> dict:
         prompt = COMPLETION_PROMPT_TEMPLATE.format(subtask=subtask, memory=memory)
 
-        current_part = types.Part.from_bytes(
-            data=_image_to_bytes(self._latest_frame), mime_type="image/jpeg"
-        )
+        current_bytes = _image_to_bytes(self._latest_frame)
+        current_part = types.Part.from_bytes(data=current_bytes, mime_type="image/jpeg")
 
+        dump_images: list[tuple[str, bytes]] = []
         if before_frame is not None:
-            before_part = types.Part.from_bytes(
-                data=_image_to_bytes(before_frame), mime_type="image/jpeg"
-            )
+            before_bytes = _image_to_bytes(before_frame)
+            before_part = types.Part.from_bytes(data=before_bytes, mime_type="image/jpeg")
             contents = [before_part, current_part, prompt]
+            dump_images = [("before", before_bytes), ("current", current_bytes)]
         else:
             contents = [current_part, prompt]
+            dump_images = [("current", current_bytes)]
 
         response = self.client.models.generate_content(
             model=self.model_id,
@@ -164,6 +220,8 @@ class ProgressMonitor:
         )
 
         raw_response = response.text or ""
+        _debug_print_vlm("ProgressMonitor.check_completion", prompt, raw_response)
+        _dump_vlm_call("check_completion", prompt, raw_response, dump_images)
         try:
             parsed = json.loads(_strip_fence(raw_response))
             result = {
@@ -234,22 +292,24 @@ class MemoryManager:
 
     def _get_scene_diff(self, after_frame: np.ndarray, subtask: str) -> str:
         prompt = MEMORY_WRITER_TEMPLATE.format(subtask=subtask)
-        after_part = types.Part.from_bytes(
-            data=_image_to_bytes(after_frame), mime_type="image/jpeg"
-        )
+        after_bytes = _image_to_bytes(after_frame)
+        after_part = types.Part.from_bytes(data=after_bytes, mime_type="image/jpeg")
         if self._last_frame is not None:
-            before_part = types.Part.from_bytes(
-                data=_image_to_bytes(self._last_frame), mime_type="image/jpeg"
-            )
+            before_bytes = _image_to_bytes(self._last_frame)
+            before_part = types.Part.from_bytes(data=before_bytes, mime_type="image/jpeg")
             contents = [before_part, after_part, prompt]
+            dump_images = [("before", before_bytes), ("after", after_bytes)]
         else:
             contents = [after_part, prompt]
+            dump_images = [("after", after_bytes)]
 
         response = self.client.models.generate_content(
             model=self.model_id,
             contents=contents,
             config=types.GenerateContentConfig(temperature=0.0),
         )
+        _debug_print_vlm("MemoryManager._get_scene_diff", prompt, response.text or "")
+        _dump_vlm_call("scene_diff", prompt, response.text or "", dump_images)
         text = _strip_fence(response.text or "")
         try:
             return json.loads(text).get("changes", text)
@@ -257,7 +317,8 @@ class MemoryManager:
             return text
 
     def _describe_initial_scene(self, frame: np.ndarray, goal: str) -> str:
-        image_part = types.Part.from_bytes(data=_image_to_bytes(frame), mime_type="image/jpeg")
+        scene_bytes = _image_to_bytes(frame)
+        image_part = types.Part.from_bytes(data=scene_bytes, mime_type="image/jpeg")
         prompt = (
             f"Describe the current scene state for objects relevant to this task: \"{goal}\". "
             "Be short and concrete (e.g. \"red cube on table to the left of bowl, bowl is empty\"). "
@@ -268,6 +329,8 @@ class MemoryManager:
             contents=[image_part, prompt],
             config=types.GenerateContentConfig(temperature=0.0),
         )
+        _debug_print_vlm("MemoryManager._describe_initial_scene", prompt, response.text or "")
+        _dump_vlm_call("describe_initial_scene", prompt, response.text or "", [("scene", scene_bytes)])
         return response.text.strip() if response.text else "(unable to describe scene)"
 
     def _write(self):
@@ -285,15 +348,16 @@ def get_next_subtask(goal: str, scene_frame: np.ndarray, memory: str) -> NextSub
     client = genai.Client(api_key=_get_api_key())
     prompt = NEXT_SUBTASK_PROMPT.format(goal=goal, memory=memory)
 
-    image_part = types.Part.from_bytes(
-        data=_image_to_bytes(scene_frame), mime_type="image/jpeg"
-    )
+    scene_bytes = _image_to_bytes(scene_frame)
+    image_part = types.Part.from_bytes(data=scene_bytes, mime_type="image/jpeg")
     response = client.models.generate_content(
         model=MODEL_ID,
         contents=[image_part, prompt],
         config=types.GenerateContentConfig(temperature=0.0),
     )
 
+    _debug_print_vlm("get_next_subtask", prompt, response.text or "")
+    _dump_vlm_call("next_subtask", prompt, response.text or "", [("scene", scene_bytes)])
     text = _strip_fence(response.text or "")
     try:
         parsed = json.loads(text)
@@ -352,15 +416,16 @@ def get_recovery_pick_place(
         goal=goal, failed_context=failed_context, memory=memory_block
     )
 
-    image_part = types.Part.from_bytes(
-        data=_image_to_bytes(scene_frame), mime_type="image/jpeg"
-    )
+    scene_bytes = _image_to_bytes(scene_frame)
+    image_part = types.Part.from_bytes(data=scene_bytes, mime_type="image/jpeg")
     response = client.models.generate_content(
         model=MODEL_ID,
         contents=[image_part, prompt],
         config=types.GenerateContentConfig(temperature=0.0),
     )
 
+    _debug_print_vlm("get_recovery_pick_place", prompt, response.text or "")
+    _dump_vlm_call("recovery_pick_place", prompt, response.text or "", [("scene", scene_bytes)])
     text = _strip_fence(response.text or "")
     try:
         parsed = json.loads(text)
